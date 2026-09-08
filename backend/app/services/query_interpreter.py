@@ -317,13 +317,53 @@ _MEANING_TYPES = {
 }
 #: the generic catch-all type — dropped first when it overlaps a more specific one
 _GENERIC_MEANING_TYPE = CriterionType.SEMANTIC_CONCEPT
-#: concept_overlap() >= this is treated as "the same underlying meaning" (1.0 for
-#: substring containment, else Jaccard token overlap)
-_DUPLICATE_OVERLAP_MIN = 0.6
+
+#: V4 PART 6 B4 — filler words that carry no dimension meaning. Two meaning
+#: criteria are "the same requirement" when their SIGNIFICANT tokens match —
+#: "professional experience in the fintech industry" vs "fintech sector
+#: experience" both reduce to {fintech}; "cybersecurity" vs "healthcare" stay
+#: distinct. This is generic — no query words, no criterion-type pairs are
+#: hardcoded.
+_B4_FILLER = {
+    "experience", "experiences", "experienced", "professional", "professionals",
+    "industry", "industries", "sector", "sectors", "work", "working", "worked",
+    "role", "roles", "background", "backgrounds", "expertise", "skill", "skills",
+    "people", "person", "someone", "somebody", "who", "that", "with", "and", "or",
+    "for", "the", "a", "an", "of", "at", "in", "on", "to", "as", "focus", "focused",
+    "related", "area", "areas", "field", "fields", "domain", "domains", "space",
+    "applied", "non", "roles", "employment", "employed", "job", "jobs", "career",
+}
+#: scope breadth — a broader scope survives a collapse (career/any beat current/past)
+_SCOPE_BREADTH = {
+    None: 3, Scope.CAREER: 3, Scope.ANY_EXPERIENCE: 3,
+    Scope.CURRENT_COMPANY: 1, Scope.PAST_COMPANY: 1,
+    Scope.CURRENT: 1, Scope.PAST: 1,
+}
 
 
 def _concept_text(c: SearchCriterion) -> str:
     return c.concept or c.value or " ".join(c.values or [])
+
+
+def _sig_tokens(text: str) -> set[str]:
+    return {
+        t for t in re.findall(r"[a-z0-9][a-z0-9+#.\-/]*", (text or "").lower())
+        if t not in _B4_FILLER and len(t) > 1
+    }
+
+
+def _same_requirement(a: SearchCriterion, b: SearchCriterion) -> bool:
+    """B4 — do two meaning criteria express ONE user requirement? True when
+    their significant-token sets are equal, one contains the other, or they
+    overlap heavily (Jaccard >= 0.6). Distinct dimensions ("software
+    engineering" vs "fintech", "cybersecurity" vs "healthcare") share no
+    significant token and stay separate."""
+    ta, tb = _sig_tokens(_concept_text(a)), _sig_tokens(_concept_text(b))
+    if not ta or not tb:
+        return concept_overlap(_concept_text(a), _concept_text(b)) >= 0.9
+    if ta == tb or ta <= tb or tb <= ta:
+        return True
+    return len(ta & tb) / len(ta | tb) >= 0.6
 
 
 def _pick_primary(a: SearchCriterion, b: SearchCriterion) -> SearchCriterion:
@@ -338,15 +378,15 @@ def _pick_primary(a: SearchCriterion, b: SearchCriterion) -> SearchCriterion:
 
 
 def _dedupe_semantic_duplicates(parsed: ParsedSearchQuery) -> None:
-    """Collapse two criteria that judge the SAME underlying meaning (V4
-    hardening PART 8) — e.g. a "research experience" professional_concept and a
-    "research" role_function for the same query are one requirement asked
-    twice, not two. This doubles judge/audit load for nothing and can silently
-    over-tighten an AND query. Detected GENERICALLY by concept-text overlap
-    within the same type-family + scope — never by hardcoded query words. A
-    real cross-domain AND ("cybersecurity AND healthcare") has near-zero
-    concept-text overlap and is untouched, preserving legitimate multi-criteria
-    requirements."""
+    """Collapse two criteria that express the SAME underlying requirement (V4
+    hardening PART 8, generalized in PART 6 B4) — e.g. "professional experience
+    in the fintech industry" (any_experience) and "fintech sector experience"
+    (career) are ONE requirement asked twice. Detected GENERICALLY via
+    significant-token equality (``_same_requirement``) ACROSS scopes — the
+    broader scope survives. A real cross-domain AND ("cybersecurity AND
+    healthcare", "software engineers AT fintech companies") shares no
+    significant token and is left as two criteria, preserving the requirement.
+    Never keyed on query words or hardcoded type pairs."""
     kept: list[SearchCriterion] = []
     for c in parsed.criteria:
         if c.type not in _MEANING_TYPES:
@@ -354,8 +394,7 @@ def _dedupe_semantic_duplicates(parsed: ParsedSearchQuery) -> None:
             continue
         dup_idx = next(
             (i for i, k in enumerate(kept)
-             if k.type in _MEANING_TYPES and k.scope == c.scope
-             and concept_overlap(_concept_text(k), _concept_text(c)) >= _DUPLICATE_OVERLAP_MIN),
+             if k.type in _MEANING_TYPES and _same_requirement(k, c)),
             None,
         )
         if dup_idx is None:
@@ -363,9 +402,13 @@ def _dedupe_semantic_duplicates(parsed: ParsedSearchQuery) -> None:
             continue
         dup = kept[dup_idx]
         primary = _pick_primary(dup, c)
+        other = c if primary is dup else dup
         primary.required = dup.required or c.required
         primary.modality = dup.modality if dup.required else (c.modality if c.required else primary.modality)
         primary.weight = round(dup.weight + c.weight, 2)
+        # keep the broader scope (career/any beat current/past)
+        if _SCOPE_BREADTH.get(other.scope, 2) > _SCOPE_BREADTH.get(primary.scope, 2):
+            primary.scope = other.scope
         kept[dup_idx] = primary
     parsed.criteria[:] = kept
 
