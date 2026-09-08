@@ -105,11 +105,11 @@ class Settings(BaseSettings):
     #: final result). When False, the fallback chain may verify, but SOME
     #: successful LLM verification is still mandatory (``require_llm_for_results``).
     search_require_anthropic: bool = False
-    #: V4 PART 6 B10 — when True, a search shows results only if the final audit
-    #: completed. Default False for now: the pre-PART-6 judge latency means the
-    #: audit is frequently cut off by ``search_max_seconds``; flip to True once
-    #: B6–B9 bring judge latency inside the deadline.
-    search_require_final_audit: bool = False
+    #: V4 PART 6 B10 — when True (default after B6–B9), a search shows results
+    #: only if the final audit completed. The PART 6 judge compaction brought
+    #: audit completion to ~100% on a normal search, so an incomplete audit now
+    #: genuinely means "verification failed" -> VERIFICATION_INCOMPLETE, results=[].
+    search_require_final_audit: bool = True
     #: hardening PART 17 — query interpretation is foundational (never metered
     #: by SEARCH_LLM_MAX_CALLS) so it must not be allowed to hold a search
     #: hostage on a slow-but-not-failing provider; a bounded timeout falls
@@ -122,10 +122,15 @@ class Settings(BaseSettings):
     #: hit, remaining optional work is skipped, deterministic results stand, and
     #: unresolved conditions stay UNKNOWN with judge/audit status PARTIAL.
     search_llm_max_calls: int = 0
-    #: hardening PART 14 — wall-clock budget for a search's OPTIONAL LLM work
-    #: (judge + audit + reason generation). Deterministic scoring is never
-    #: skipped for time. <= 0 disables the deadline (unlimited).
-    search_max_seconds: float = 45.0
+    #: V4 PART 6 B9 — ONE end-to-end request budget. Every expensive stage checks
+    #: ``deadline.remaining()`` and will not start work that cannot finish. If it
+    #: expires BEFORE required AI verification completes the search returns
+    #: VERIFICATION_INCOMPLETE with results=[] (never deterministic fallback).
+    #: Measured: a fully-verified Sonnet-5 search (interp + exhaustive judge +
+    #: grounded audit) on the ~1k dataset runs ~60–120 s, so this is a generous
+    #: runaway-protection ceiling, NOT a tight interactive SLA — see the PART 6
+    #: report for the honest latency numbers. <= 0 disables it (tests).
+    search_max_seconds: float = 200.0
 
     # ── Search quality v2 ────────────────────────────────────
     relevance_weight: float = 20.0         # points reserved for whole-profile relevance

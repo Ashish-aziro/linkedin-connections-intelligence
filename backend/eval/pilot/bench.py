@@ -105,14 +105,15 @@ class Meter:
             self.stopped_reason = f"cost cap reached (${self.cost_usd:.3f}/${self.max_cost:.2f})"
             raise BudgetExceeded(self.stopped_reason)
 
-    def note(self, t_in: int, t_out: int, ms: float, stop_reason: str | None, raw: dict | None) -> None:
+    def note(self, t_in: int, t_out: int, ms: float, stop_reason: str | None, raw: dict | None,
+             max_tokens: int | None = None) -> None:
         self.calls += 1
         c = self.price(self.current_model, t_in, t_out)
         self.cost_usd += c
         self.call_log.append({
             "n": self.calls, "op": self.current_op, "model": self.current_model,
-            "in": t_in, "out": t_out, "ms": round(ms, 1), "cost": round(c, 6),
-            "stop_reason": stop_reason,
+            "in": t_in, "out": t_out, "max_tokens": max_tokens, "ms": round(ms, 1),
+            "cost": round(c, 6), "stop_reason": stop_reason,
         })
         self.raw_by_op.setdefault(self.current_op, []).append({"dict": raw, "stop_reason": stop_reason})
 
@@ -135,6 +136,7 @@ class _HttpxProxy:
         m = _METER
         if m is not None:
             m.before_call()
+        req_max_tokens = (kw.get("json") or {}).get("max_tokens")
         t0 = time.perf_counter()
         resp = object.__getattribute__(self, "_real").post(url, **kw)
         dt = (time.perf_counter() - t0) * 1000.0
@@ -160,7 +162,7 @@ class _HttpxProxy:
                     raw = {"_parse_error": True}
             except Exception:  # noqa: BLE001  — non-JSON error body etc.
                 pass
-            m.note(t_in, t_out, dt, stop, raw)
+            m.note(t_in, t_out, dt, stop, raw, req_max_tokens)
         return resp
 
 
@@ -540,6 +542,8 @@ def _dataset_regression(model: str, query: str) -> dict:
     before = _op_counts_snapshot()
     c0, cost0 = m.calls, m.cost_usd
     eng = create_engine(f"sqlite:///{tmp.as_posix()}", future=True)
+    from app.database import ensure_schema as _ensure_schema
+    _ensure_schema(eng)
     S = sessionmaker(bind=eng, autoflush=False, expire_on_commit=False, future=True)
     t0 = time.perf_counter()
     try:
@@ -648,6 +652,10 @@ def cmd_all(args) -> None:
     from sqlalchemy.orm import sessionmaker
 
     eng = create_engine(f"sqlite:///{pilot_db.as_posix()}", future=True)
+
+    from app.database import ensure_schema as _ensure_schema
+
+    _ensure_schema(eng)
     Session = sessionmaker(bind=eng, autoflush=False, expire_on_commit=False, future=True)
 
     try:
@@ -886,6 +894,10 @@ def cmd_round2(args) -> None:
     from sqlalchemy.orm import sessionmaker
 
     eng = create_engine(f"sqlite:///{pilot_db.as_posix()}", future=True)
+
+    from app.database import ensure_schema as _ensure_schema
+
+    _ensure_schema(eng)
     Session = sessionmaker(bind=eng, autoflush=False, expire_on_commit=False, future=True)
 
     try:
@@ -962,10 +974,122 @@ def cmd_round2(args) -> None:
         print(f"\n{_summary_line(_METER)}\nwrote {p}")
 
 
+def cmd_tune(args) -> None:
+    """Phase B tuning loop — run ONE query's full pipeline on pilot.db through the
+    PRODUCTION Anthropic client (no shim) and dump the per-judge-call budget
+    picture (input / output / max_tokens / stop_reason) + judge/audit metadata."""
+    global _METER
+    _METER = Meter(max_calls=args.max_calls, max_cost=args.max_cost)
+    _METER.calls = args.start_calls
+    _METER.cost_usd = args.start_cost
+    pilot_db = Path(args.pilot_db)
+    query = args.query or REGRESSION_QUERY
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    eng = create_engine(f"sqlite:///{pilot_db.as_posix()}", future=True)
+
+    from app.database import ensure_schema as _ensure_schema
+
+    _ensure_schema(eng)
+    Session = sessionmaker(bind=eng, autoflush=False, expire_on_commit=False, future=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out: dict = {"phase": "B-tune", "query": query, "model": "claude-sonnet-5",
+                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "runs": []}
+    try:
+        with _meter_httpx(), _op_capture(), _anthropic_only():
+            _warm_local_models()
+            with Session() as db:
+                for i in range(args.repeat):
+                    with _use_model("claude-sonnet-5"):
+                        rec = _pipeline_run(db, "claude-sonnet-5", f"tune{i}", query)
+                    calls = [c for c in _METER.call_log if c["op"] == "semantic_judge"][-40:]
+                    jrun = {
+                        "run": i, "wall_ms": rec["wall_ms"], "cost": rec["total_cost"],
+                        "exact": rec["exact"], "possible": rec["possible"],
+                        "interp_ms": rec["stage"]["query_interpretation"]["ms"],
+                        "judge_ms": rec["stage"]["semantic_judge"]["ms"],
+                        "judge": rec["judge"], "audit": rec["audit"],
+                        "judge_trace": rec["judge_trace"],
+                        "judge_calls": [
+                            {"in": c["in"], "out": c["out"], "max_tokens": c["max_tokens"],
+                             "stop": c["stop_reason"], "ms": c["ms"]}
+                            for c in calls
+                        ],
+                    }
+                    out["runs"].append(jrun)
+                    print(f"run {i}: interp={jrun['interp_ms']:.0f}ms judge={jrun['judge_ms']:.0f}ms "
+                          f"calls={jrun['judge']['batch_count']} trunc={jrun['judge']['truncations']} "
+                          f"splits={jrun['judge']['adaptive_splits']} audit={jrun['audit']['status']} "
+                          f"exact={jrun['exact']} poss={jrun['possible']} {_summary_line(_METER)}")
+                    for c in jrun["judge_calls"]:
+                        print(f"    judge call: in={c['in']} out={c['out']} max_tokens={c['max_tokens']} "
+                              f"stop={c['stop']} {c['ms']:.0f}ms")
+    finally:
+        eng.dispose()
+        out["budget"] = {"calls": _METER.calls - args.start_calls,
+                         "cost": round(_METER.cost_usd - args.start_cost, 4),
+                         "total_calls": _METER.calls, "total_cost": round(_METER.cost_usd, 4)}
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        p = RESULTS_DIR / f"tune_{ts}.json"
+        p.write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
+        print(f"\n{_summary_line(_METER)}\nwrote {p}")
+
+
+def cmd_regress(args) -> None:
+    """B11/B16 — the real 991-profile nonprofit/Chicago query through the
+    PRODUCTION Anthropic client + Sonnet 5. Warms local models first, reports
+    cold-start separately, dumps the full judge/audit picture + target ranks."""
+    global _METER
+    _METER = Meter(max_calls=args.max_calls, max_cost=args.max_cost)
+    _METER.calls = args.start_calls
+    _METER.cost_usd = args.start_cost
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    out: dict = {"phase": "B-regress", "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    try:
+        with _meter_httpx(), _op_capture(), _anthropic_only():
+            out["cold_start"] = _warm_local_models()
+            print(f"cold-start: {out['cold_start']}")
+            for i in range(args.repeat):
+                with _use_model("claude-sonnet-5"):
+                    rec = _dataset_regression("claude-sonnet-5", args.query or REGRESSION_QUERY)
+                out.setdefault("runs", []).append(rec)
+                jc = [c for c in _METER.call_log if c["op"] == "semantic_judge"]
+                ac = [c for c in _METER.call_log if c["op"] == "final_result_audit"]
+                print(f"\nrun {i}: {rec['wall_ms']:.0f}ms wall · anthropic {rec['anthropic_latency_ms']:.0f}ms "
+                      f"· calls {rec['anthropic_calls']} · ${rec['cost']:.4f}")
+                print(f"  interp: {rec['interpretation_provider']} ({rec['interpretation_model']})  "
+                      f"judge: {rec['judge_status']} batches={rec['judge_batches']} trunc={rec['judge_truncations']} "
+                      f"splits={rec['judge_splits']} cand={rec['judge_candidates']}")
+                print(f"  audit: {rec['audit_status']} completed={rec['audit_completed']} "
+                      f"missing_req={rec['audit_missing_required_reviews']} deadline={rec['deadline_reached']}")
+                print(f"  exact={rec['exact']} possible={rec['possible']} returned={rec['returned']} "
+                      f"near={rec['near']} llm_verified={rec['llm_verified_results']}")
+                print(f"  stage timings: {rec['profile_timings_ms']}")
+                for name, hit in rec["targets"].items():
+                    print(f"  {name}: {hit}")
+                print(f"  top10: " + " | ".join(f"{x['rank']}.{x['name']}({x['score']},{x['qualification'][:4]},v={x['llm_verified']})"
+                                                for x in rec["top15"][:10]))
+                for c in jc[-30:]:
+                    print(f"    judge call in={c['in']} out={c['out']} max={c['max_tokens']} stop={c['stop_reason']} {c['ms']:.0f}ms")
+                for c in ac:
+                    print(f"    audit call in={c['in']} out={c['out']} max={c['max_tokens']} stop={c['stop_reason']} {c['ms']:.0f}ms")
+    finally:
+        out["budget"] = {"calls": _METER.calls - args.start_calls,
+                         "cost": round(_METER.cost_usd - args.start_cost, 4),
+                         "total_calls": _METER.calls, "total_cost": round(_METER.cost_usd, 4)}
+        out["call_log"] = _METER.call_log
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        p = RESULTS_DIR / f"regress_{ts}.json"
+        p.write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
+        print(f"\n{_summary_line(_METER)}\nwrote {p}")
+
+
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(description="Phase A — Anthropic model benchmark (eval-only)")
+    ap = argparse.ArgumentParser(description="Phase A/B — Anthropic model benchmark (eval-only)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("all", "probe", "round2"):
+    for name in ("all", "probe", "round2", "tune", "regress"):
         p = sub.add_parser(name)
         p.add_argument("--max-calls", type=int, default=120 if name == "all" else 180)
         p.add_argument("--max-cost", type=float, default=4.0 if name == "all" else 6.0)
@@ -973,8 +1097,11 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--start-calls", type=int, default=0)
         p.add_argument("--start-cost", type=float, default=0.0)
         p.add_argument("--round1-json", default="")
+        p.add_argument("--query", default="")
+        p.add_argument("--repeat", type=int, default=1)
     args = ap.parse_args(argv)
-    {"all": cmd_all, "probe": cmd_probe, "round2": cmd_round2}[args.cmd](args)
+    {"all": cmd_all, "probe": cmd_probe, "round2": cmd_round2, "tune": cmd_tune,
+     "regress": cmd_regress}[args.cmd](args)
 
 
 if __name__ == "__main__":

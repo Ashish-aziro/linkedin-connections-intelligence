@@ -135,8 +135,11 @@ def decide(
                     "AI semantic verification could not be completed. No results were "
                     "returned to avoid showing unverified matches.")
 
-    # 3 — final audit, when the deployment requires it
-    if settings.search_require_final_audit and required_semantic:
+    # 3 — final audit, when the deployment requires it (B10). Only enforced when
+    # the audit is actually enabled, results require an LLM, and the query has a
+    # semantic criterion the audit would review.
+    if (settings.search_require_final_audit and settings.final_result_audit_enabled
+            and require_llm and required_semantic):
         audit_ok = audit_ran and (audit_meta or {}).get("status") in ("full", "partial") \
             and int((audit_meta or {}).get("successful_batches") or 0) > 0
         if not audit_ok:

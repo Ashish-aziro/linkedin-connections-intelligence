@@ -22,6 +22,7 @@ Flow (V4 PART 3 §21):
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import replace
 
@@ -322,19 +323,25 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
         total_candidates=total_scored,
     )
 
-    # ── batched display-reason generation (hardening PART 10) — ONE LLM call
-    #    for the whole top-N instead of one per candidate. Display-only: never
-    #    affects ranking / qualification / score. ──────────────────────────
-    # skip the LLM reason path once the deadline is spent — a name/company/skill
-    # deterministic template still explains every result, it just isn't prose.
+    # ── display reasons. V4 PART 6 B11 — an APPROVED candidate already has a
+    #    grounded one-liner from the final audit (its evidence was validated),
+    #    so no separate reason-generation LLM call is made for it. Only the
+    #    candidates the audit did not give a reason for fall to the batched
+    #    reason generator, then the deterministic template. ──────────────────
+    audit_reasons = {
+        pid: v["display_reason"] for pid, v in audit_by_id.items() if v.get("display_reason")
+    }
+    need_reason = [c for c in top if c.person.id not in audit_reasons]
     llm_reason_pool = (
-        top[: settings.llm_reason_top_n]
+        need_reason[: settings.llm_reason_top_n]
         if settings.llm_reason_generation and not deadline.expired() else []
     )
     with prof.stage("reason_generation"):
-        reasons_by_id = (
-            generate_reasons_batch(llm_reason_pool, query, facts_by_id=facts_by_id) if llm_reason_pool else {}
-        )
+        reasons_by_id = {
+            **audit_reasons,
+            **(generate_reasons_batch(llm_reason_pool, query, facts_by_id=facts_by_id)
+               if llm_reason_pool else {}),
+        }
 
     results: list[SearchResultItem] = []
     for rank, cand in enumerate(top, start=1):
@@ -391,6 +398,9 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     llm_calls["profile"] = profile_dict
     search_profile.clear()
 
+    from app.services.model_warmup import ready as _models_ready
+
+    _mw = _models_ready()
     verification_metadata = {
         **ident,
         "search_status": status,
@@ -399,22 +409,40 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
         "unverified_results_suppressed": 0,
         "reason": None,
     }
-
-    # B29 — ONE concise structured summary line (no keys / prompts / profile data).
-    log.info(
-        "search %r -> %s | verification=%s ai_provider=%s anthropic(att=%s ok=%s) fallback=%s "
-        "llm_calls=%d total_ms=%d deadline_reached=%s judge=%s audit=%s "
-        "hard_gate(viable=%d rejected=%d) judge(batches=%s trunc=%s splits=%s) "
-        "verified_results=%d suppressed=0 stage_ms=%s",
-        query, status, verification_status, ident["ai_provider"],
-        ident["anthropic_attempted"], ident["anthropic_succeeded"], ident["fallback_used"],
-        llm_calls["total"], deadline.elapsed_ms(), deadline.expired(),
-        judge_metadata.get("status"), (audit_metadata or {}).get("status"),
-        len(viable), len(hard_rejected),
-        judge_metadata.get("judge_batch_count"), judge_metadata.get("truncations"),
-        judge_metadata.get("adaptive_splits"),
-        sum(1 for r in results if r.llm_verified), profile_dict["timings_ms"],
-    )
+    _tm = profile_dict["timings_ms"]
+    am = audit_metadata or {}
+    # B15/B29 — ONE concise structured summary. No keys / prompts / profile data.
+    observability = {
+        "query": query, "total_connections": total,
+        "interpretation_provider": provider, "interpretation_model": model,
+        "interpretation_ms": _tm.get("query_interpretation"),
+        "interpretation_attempts": calls_interpretation,
+        "hard_gate_viable": len(viable), "hard_gate_rejected": len(hard_rejected),
+        "anthropic_attempted": ident["anthropic_attempted"],
+        "anthropic_succeeded": ident["anthropic_succeeded"],
+        "anthropic_calls": sum(n for p, n in {**judge_metadata.get("providers", {}),
+                                              **am.get("providers", {})}.items()
+                               if str(p).startswith("anthropic")) + calls_interpretation,
+        "fallback_used": ident["fallback_used"], "total_llm_calls": llm_calls["total"],
+        "judge_candidates": judge_metadata.get("judge_candidate_count"),
+        "judge_batches": judge_metadata.get("judge_batch_count"),
+        "judge_calls": judge_metadata.get("judge_batch_count"),
+        "judge_truncations": judge_metadata.get("truncations"),
+        "judge_splits": judge_metadata.get("adaptive_splits"),
+        "judge_ms": _tm.get("judge"), "judge_status": judge_metadata.get("status"),
+        "audit_candidates": am.get("audited_candidates"),
+        "audit_calls": am.get("batch_count"), "audit_ms": _tm.get("audit"),
+        "audit_status": am.get("status"),
+        "reason_calls": reason_calls,
+        "embedding_model_warm": _mw["embedding_model_ready"],
+        "reranker_model_warm": _mw["reranker_model_ready"],
+        "llm_verified_results": sum(1 for r in results if r.llm_verified),
+        "unverified_results_suppressed": 0,
+        "deadline_seconds": deadline.seconds, "deadline_reached": deadline.expired(),
+        "total_ms": _tm.get("total"), "search_status": status,
+    }
+    llm_calls["observability"] = observability
+    log.info("search summary %s", json.dumps(observability, default=str))
 
     # FINAL validated search-level snapshot (V4 PART 7 §3) — captured here, AFTER
     # _run_final_audit -> final_auditor.finalize(). load_search rebuilds the whole

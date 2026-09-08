@@ -510,9 +510,10 @@ class CompactCriterionVerdict(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     supporting_refs: list[str] = []
     contradicting_refs: list[str] = []
-    #: short ONLY — kept because judge_validator's mentor/passive-mentee check
-    #: reads verdict text; NOT a user-facing explanation.
-    reason: str = Field(default="", max_length=100)
+    #: V4 PART 6 B6 — populate ONLY for a FALSE / borderline verdict (<= 8 words).
+    #: judge_validator reads it for the mentor/passive-mentee + complete-data
+    #: checks; it is never a user-facing explanation. Empty for true/unknown.
+    reason: str = Field(default="", max_length=80)
 
     @field_validator("status", mode="before")
     @classmethod
@@ -568,7 +569,8 @@ class CompactAuditCriterionReview(BaseModel):
     status_review: str = "uncertain"
     supporting_refs: list[str] = []
     contradicting_refs: list[str] = []
-    reason: str = Field(default="", max_length=100)
+    #: V4 PART 6 B6 — <= 10 words, ONLY for unsupported/uncertain/downgrade/incorrect.
+    reason: str = Field(default="", max_length=90)
 
     @field_validator("status_review", mode="before")
     @classmethod
@@ -591,6 +593,16 @@ class CompactAuditPersonDecision(BaseModel):
     decision: str = "unknown"
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
     criteria: list[CompactAuditCriterionReview] = []
+    #: V4 PART 6 B11 — for an APPROVED candidate, one plain sentence naming the
+    #: concrete evidence (<= 30 words, no praise). Used verbatim as the result
+    #: card explanation so a separate reason-generation LLM call is not needed.
+    #: Display-only: never affects score / qualification. Empty otherwise.
+    display_reason: str = Field(default="", max_length=300)
+
+    @field_validator("display_reason", mode="before")
+    @classmethod
+    def _short_reason(cls, v):
+        return (str(v or "").strip())[:300]
 
     @field_validator("decision", mode="before")
     @classmethod
