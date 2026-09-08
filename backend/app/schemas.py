@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.constants import (
     _QUERY_INTENT_ALIASES,
@@ -719,6 +719,51 @@ class SearchCriterion(BaseModel):
         return self
 
 
+class LenientSearchCriterion(BaseModel):
+    """TRANSPORT-ONLY (V4 PART 6 B3). The shapes a model legitimately emits —
+    ``value: null`` (it used ``concept``/``values`` instead), a missing ``id``,
+    ``values`` as a bare string, ``weight`` absent. Normalized into a strict
+    ``SearchCriterion`` by ``query_transport.repair_plan`` BEFORE the real plan
+    is validated, so one harmless nullable field never triggers three identical
+    Anthropic retries. The strict schema below is unchanged and still strict."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = None
+    type: str | None = None
+    weight: float | int | str | None = None
+    required: bool | None = None
+    value: str | list | dict | None = None
+    values: list | str | None = None
+    operator: str | None = None
+    scope: str | None = None
+    concept: str | None = None
+    modality: str | None = None
+
+
+class LenientSearchPlan(BaseModel):
+    """TRANSPORT-ONLY (V4 PART 6 B3) — the permissive parse target for the
+    query-interpretation LLM call. Everything optional; repaired then
+    re-validated against the strict ``ParsedSearchQuery``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    intent: object | None = None
+    criteria: list[LenientSearchCriterion] = []
+    context: object | None = None
+    target_person_context: object | None = None
+    unresolved: object | None = None
+    interpretation_summary: object | None = None
+    interpretation_confidence: object | None = None
+
+    @field_validator("criteria", mode="before")
+    @classmethod
+    def _only_objects(cls, v):
+        if not isinstance(v, list):
+            return [v] if isinstance(v, dict) else []
+        return [c for c in v if isinstance(c, (dict, LenientSearchCriterion))]
+
+
 class ParsedSearchQuery(BaseModel):
     #: reusable search intent (V4 PART 2 §1) — one of ``ALL_QUERY_INTENTS``.
     #: Shapes which criteria matter; never a search phrase itself.
@@ -880,3 +925,24 @@ class SearchResponse(BaseModel):
     #: prompts, no profile data. Live-response only for now (not yet persisted —
     #: same bootstrapping step judge/audit metadata went through before PART 7).
     llm_calls: dict[str, Any] | None = None
+
+    # ── V4 PART 6 B2/B9/B12/B30 — AI verification state ──────────────────────
+    #: end-to-end outcome — ``SearchStatus``. ``success`` / ``success_with_fallback``
+    #: carry results; ``verification_incomplete`` / ``ai_unavailable`` never do.
+    search_status: str = "success"
+    #: did the LLM verification this query needed actually happen — ``VerificationStatus``.
+    verification_status: str = "not_required"
+    #: which LLM actually verified the search (provider family, e.g. "anthropic",
+    #: "groq_primary") and a human-facing model name. Null when none did.
+    ai_provider: str | None = None
+    ai_model: str | None = None
+    #: was Anthropic tried first / did it succeed / did the chain fall back.
+    anthropic_attempted: bool = False
+    anthropic_succeeded: bool = False
+    fallback_used: bool = False
+    #: True only when the pipeline completed with validated LLM output backing
+    #: the shown results (not merely "deterministic scoring ran").
+    llm_verified: bool = False
+    #: deterministic candidates computed but withheld because verification did
+    #: not complete (observability only).
+    unverified_results_suppressed: int = 0

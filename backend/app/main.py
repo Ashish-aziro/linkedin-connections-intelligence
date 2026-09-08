@@ -18,6 +18,9 @@ log = logging.getLogger("app")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    from app.services.model_warmup import start as _warm_models
+
+    _warm_models()  # B5 — background preload of MiniLM + cross-encoder
     log.info(
         "startup ok — env=%s use_fixtures=%s apify=%s anthropic=%s groq=%s openrouter=%s",
         settings.environment,

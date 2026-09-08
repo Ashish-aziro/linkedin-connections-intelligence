@@ -1,28 +1,25 @@
-"""Anthropic Messages API client (paid — opt-in only).
+"""BENCHMARK-ONLY Anthropic Messages client for Claude 5-family models.
 
-Not OpenAI-compatible: different endpoint, headers, and body shape.
+Same role as ``app.services.llm.anthropic_client.messages_json`` and the same
+error taxonomy (so the router + adaptive splitter behave identically), but:
 
-**Claude 5 compatibility (V4 PART 6 B0).** Current-generation Claude models
-(Sonnet 5 / Opus 5 / the Fable line, and Claude 4.7+) reject two things the
-earlier client relied on, both with HTTP 400:
+  * sends **no** assistant-turn prefill   — Claude 5 returns 400
+    ("This model does not support assistant message prefill")
+  * sends **no** ``temperature``          — Claude 5 returns 400
+    ("`temperature` is deprecated for this model")
+  * reads only ``text`` content blocks    — ignores any ``thinking`` block
 
-  * ``temperature``            — "`temperature` is deprecated for this model"
-  * an assistant-turn prefill  — "This model does not support assistant message
-    prefill. The conversation must end with a user message."
+It deliberately reuses ``anthropic_client.httpx`` so the benchmark's metering /
+budget-guard proxy (installed on that attribute) still sees every call.
 
-So this client sends **neither**. It is a capability choice, not a per-model
-branch — older models accept a request with no ``temperature`` and no prefill
-too, and JSON is coaxed by the system instruction + ``_extract_json`` (which
-already tolerates ``` fences and a leading prose sentence). Only ``text``
-content blocks are read; a ``thinking`` block, if the model emits one, is
-ignored.
+Confined to ``eval/pilot/``. Production ``anthropic_client.py`` is NOT modified
+in Phase A. The API key is taken from ``settings`` and never logged.
 """
 from __future__ import annotations
 
 import logging
 
-import httpx
-
+from app.services.llm import anthropic_client as _ac
 from app.services.llm.base import (
     LLMAuthError,
     LLMBadOutput,
@@ -35,26 +32,13 @@ from app.services.llm.base import (
 )
 from app.services.llm.openai_compatible import _extract_json
 
-log = logging.getLogger("app.llm")
+log = logging.getLogger("app.llm.bench_v5")
 
 _URL = "https://api.anthropic.com/v1/messages"
 _VERSION = "2023-06-01"
 
 
-def _text_blocks(content) -> str:
-    """Concatenate every ``text`` block; skip ``thinking`` / ``redacted_thinking``
-    / tool blocks. Raises ``LLMBadOutput`` on an unexpected shape."""
-    try:
-        return "".join(
-            block.get("text", "")
-            for block in (content or [])
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-    except (AttributeError, TypeError) as e:  # pragma: no cover - defensive
-        raise LLMBadOutput(f"unexpected Anthropic response shape: {e}") from e
-
-
-def messages_json(
+def messages_json_v5(
     *,
     api_key: str,
     model: str,
@@ -64,13 +48,11 @@ def messages_json(
     workspace_id: str = "",
     timeout: float = 60.0,
 ) -> dict:
+    httpx = _ac.httpx  # proxied by the benchmark metering context when active
     payload = {
         "model": model,
         "max_tokens": max_tokens,
-        # NO "temperature" — deprecated on Claude 5, and unnecessary here.
         "system": system_prompt + "\n\nRespond with a single JSON object and nothing else.",
-        # NO assistant prefill — Claude 5 requires the conversation to end with
-        # a user message.
         "messages": [{"role": "user", "content": user_prompt}],
     }
     headers = {
@@ -99,18 +81,22 @@ def messages_json(
     if resp.status_code == 413:
         raise LLMRequestTooLarge(f"anthropic {resp.status_code}: request too large")
     if resp.status_code == 400 and "workspace" in resp.text.lower():
-        # identity-linked key without / with a wrong ANTHROPIC_WORKSPACE_ID (V4 §7)
         raise LLMConfigError("anthropic workspace configuration error")
     if resp.status_code in (400, 404):
-        # unknown model, malformed request, billing/credit problem — identical on
-        # retry, so the router moves to the next provider and cools this one down.
         raise LLMConfigError(f"anthropic request rejected ({resp.status_code}): {resp.text[:200]}")
     if resp.status_code >= 400:
         raise LLMConfigError(f"anthropic error {resp.status_code}")
 
     body = resp.json()
     stop_reason = body.get("stop_reason")
-    text = _text_blocks(body.get("content", []))
+    try:
+        text = "".join(
+            block.get("text", "")
+            for block in body.get("content", [])
+            if block.get("type") == "text"
+        )
+    except (AttributeError, TypeError) as e:
+        raise LLMBadOutput(f"unexpected Anthropic response shape: {e}") from e
 
     if not text.strip():
         if stop_reason == "max_tokens":
@@ -122,9 +108,6 @@ def messages_json(
     try:
         return _extract_json(text)
     except LLMBadOutput as e:
-        # a genuinely malformed response stays LLMBadOutput (retry-same-provider
-        # can still help); one that hit the token ceiling gets its own category
-        # so the caller SPLITS the batch instead of resubmitting the same request.
         if stop_reason == "max_tokens":
             raise LLMOutputTruncated(
                 f"Anthropic hit max_tokens={max_tokens} before completing valid JSON "

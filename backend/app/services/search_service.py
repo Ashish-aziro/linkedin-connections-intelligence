@@ -29,7 +29,15 @@ from sqlalchemy.orm import Session
 
 from app import repositories as repo
 from app.config import settings
-from app.constants import _QUALIFICATION_RANK, CriterionType, Qualification
+from app.constants import (
+    _QUALIFICATION_RANK,
+    CriterionType,
+    JUDGEABLE_CRITERION_TYPES,
+    Qualification,
+    RESULT_BEARING_STATUSES,
+    SearchStatus,
+    VerificationStatus,
+)
 from app.models import SearchQuery
 from app.schemas import (
     ConnectionBucket,
@@ -38,6 +46,7 @@ from app.schemas import (
     SearchResponse,
     SearchResultItem,
 )
+from app.services import search_verification as _verify
 from app.services.candidate_gate import hard_gate
 from app.services.candidate_pool import get_candidates
 from app.services.deadline import Deadline
@@ -86,6 +95,25 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     #    is never metered. Cleared unconditionally before returning below. ──
     llm_budget.start_budget(settings.search_llm_max_calls)
     calls_interpretation = 0 if provider == "deterministic" else 1
+
+    # ── V4 PART 6 B2/B3/B13 — NO LLM ⇒ NO RESULTS. If interpretation fell back
+    #    to the deterministic parser (or Anthropic is required and did not run
+    #    it), do NOT continue into a normal result response — a keyword-only
+    #    plan must never be shown as Exact/Possible matches. ───────────────────
+    required_semantic = any(
+        c.required and c.type in JUDGEABLE_CRITERION_TYPES for c in parsed.criteria
+    )
+    _gate = _verify.interpretation_gate(provider)
+    if _gate is not None:
+        _gs, _gvs, _greason = _gate
+        llm_budget.clear_budget()
+        search_profile.clear()
+        return _no_result_response(
+            db, dataset_id=dataset_id, query=query, parsed=parsed,
+            provider=provider, model=model, status=_gs,
+            verification_status=_gvs, reason=_greason,
+            ident=_verify.ai_identity(provider, model),
+        )
 
     with prof.stage("query_embedding"):
         query_embedding = _maybe_embed(query)  # for relevance RANKING only — never gates
@@ -244,6 +272,40 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     total_scored = len(scored)
     exact_n = sum(1 for s in scored if s.qualification == Qualification.EXACT_MATCH)
     possible_n = sum(1 for s in scored if s.qualification == Qualification.POSSIBLE_MATCH)
+
+    judge_metadata = judge_run.metadata.as_dict()
+    audit_metadata = audit_run.metadata.as_dict() if audit_run else None
+
+    # ── V4 PART 6 B2/B4/B5/B12 — verification gate. A required semantic judge
+    #    that produced no valid verdicts, or a required final audit that could
+    #    not complete, means the search returns NO user-visible candidates
+    #    (VERIFICATION_INCOMPLETE) rather than unverified deterministic ones. ──
+    status, verification_status, fail_reason = _verify.decide(
+        interp_provider=provider, required_semantic=required_semantic,
+        judge_meta=judge_metadata, audit_meta=audit_metadata,
+        audit_ran=audit_run is not None, deadline_reached=deadline.expired(),
+    )
+    ident = _verify.ai_identity(
+        provider, model, judge_metadata.get("providers"),
+        (audit_metadata or {}).get("providers"),
+    )
+    if status not in RESULT_BEARING_STATUSES:
+        llm_budget.clear_budget()
+        prof.timings_ms["total"] = round((_time.perf_counter() - _wall_start) * 1000.0, 1)
+        search_profile.clear()
+        log.info("search %r -> %s (%s): %s", query, status, verification_status, fail_reason)
+        return _no_result_response(
+            db, dataset_id=dataset_id, query=query, parsed=parsed, provider=provider,
+            model=model, status=status, verification_status=verification_status,
+            reason=fail_reason, ident=ident, judge_metadata=judge_metadata,
+            audit_metadata=audit_metadata, total_candidates=total_scored, suppressed=total_scored,
+        )
+    if ident["fallback_used"]:
+        status = SearchStatus.SUCCESS_WITH_FALLBACK
+    llm_verified_flag = verification_status == VerificationStatus.COMPLETE or (
+        not required_semantic and provider != "deterministic"
+    )
+
     # ONE authoritative user-facing result count (V4 PART 5.5 §20): TOP_CONNECTIONS.
     if audit_run is not None:
         top = survivors[: settings.top_connections]  # audited candidates only
@@ -308,9 +370,6 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
             reason=item.reason, payload=item.model_dump(),
         )
 
-    judge_metadata = judge_run.metadata.as_dict()
-    audit_metadata = audit_run.metadata.as_dict() if audit_run else None
-
     # hardening PART 6 — per-search LLM call tally, no prompts/profile data.
     # judge/audit batch counts already include every adaptive-split attempt.
     reason_calls = 1 if (llm_reason_pool and settings.llm_reason_generation
@@ -332,12 +391,29 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     llm_calls["profile"] = profile_dict
     search_profile.clear()
 
+    verification_metadata = {
+        **ident,
+        "search_status": status,
+        "verification_status": verification_status,
+        "llm_verified": llm_verified_flag,
+        "unverified_results_suppressed": 0,
+        "reason": None,
+    }
+
+    # B29 — ONE concise structured summary line (no keys / prompts / profile data).
     log.info(
-        "search %r done: llm_calls=%d elapsed_ms=%d deadline_s=%s deadline_reached=%s "
-        "judge_status=%s audit_status=%s | stage_ms=%s counters=%s",
-        query, llm_calls["total"], deadline.elapsed_ms(), deadline.seconds, deadline.expired(),
+        "search %r -> %s | verification=%s ai_provider=%s anthropic(att=%s ok=%s) fallback=%s "
+        "llm_calls=%d total_ms=%d deadline_reached=%s judge=%s audit=%s "
+        "hard_gate(viable=%d rejected=%d) judge(batches=%s trunc=%s splits=%s) "
+        "verified_results=%d suppressed=0 stage_ms=%s",
+        query, status, verification_status, ident["ai_provider"],
+        ident["anthropic_attempted"], ident["anthropic_succeeded"], ident["fallback_used"],
+        llm_calls["total"], deadline.elapsed_ms(), deadline.expired(),
         judge_metadata.get("status"), (audit_metadata or {}).get("status"),
-        profile_dict["timings_ms"], profile_dict["counters"],
+        len(viable), len(hard_rejected),
+        judge_metadata.get("judge_batch_count"), judge_metadata.get("truncations"),
+        judge_metadata.get("adaptive_splits"),
+        sum(1 for r in results if r.llm_verified), profile_dict["timings_ms"],
     )
 
     # FINAL validated search-level snapshot (V4 PART 7 §3) — captured here, AFTER
@@ -355,6 +431,8 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
         external_searched=False,
         judge_metadata=judge_metadata,
         audit_metadata=audit_metadata,
+        search_status=status,
+        verification_metadata=verification_metadata,
     )
 
     return SearchResponse(
@@ -371,6 +449,56 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
         judge_metadata=judge_metadata,
         audit_metadata=audit_metadata,
         llm_calls=llm_calls,
+        search_status=status,
+        verification_status=verification_status,
+        ai_provider=ident["ai_provider"],
+        ai_model=ident["ai_model"],
+        anthropic_attempted=ident["anthropic_attempted"],
+        anthropic_succeeded=ident["anthropic_succeeded"],
+        fallback_used=ident["fallback_used"],
+        llm_verified=llm_verified_flag,
+        unverified_results_suppressed=0,
+    )
+
+
+def _no_result_response(
+    db: Session, *, dataset_id: str, query: str, parsed: ParsedSearchQuery,
+    provider: str | None, model: str | None, status: str, verification_status: str,
+    reason: str | None, ident: dict, judge_metadata: dict | None = None,
+    audit_metadata: dict | None = None, total_candidates: int = 0, suppressed: int = 0,
+) -> SearchResponse:
+    """V4 PART 6 B2/B3/B22 — a search that could not be AI-verified. Persists the
+    diagnostic state but NO ``search_results`` rows, so a reload can never
+    resurrect unverified deterministic candidates (B38)."""
+    sq = repo.create_search_query(
+        db, dataset_id=dataset_id, query_text=query,
+        interpreted_query_json=parsed.model_dump(),
+        llm_provider=provider, llm_model=model, total_candidates=total_candidates,
+    )
+    verification_metadata = {
+        **ident, "search_status": status, "verification_status": verification_status,
+        "llm_verified": False, "unverified_results_suppressed": suppressed, "reason": reason,
+    }
+    repo.upsert_search_run_state(
+        db, sq.id, response_version=RESPONSE_VERSION,
+        exact_match_count=0, possible_match_count=0, returned_count=0, near_match_count=0,
+        total_candidates=total_candidates, external_searched=False,
+        judge_metadata=judge_metadata, audit_metadata=audit_metadata,
+        search_status=status, verification_metadata=verification_metadata,
+    )
+    return SearchResponse(
+        search_id=sq.id, query=query, interpreted_query=parsed.model_dump(),
+        connections=ConnectionBucket(total_candidates=total_candidates, returned=0, results=[],
+                                     exact_match_count=0, possible_match_count=0, near_matches=[]),
+        external=ExternalBucket(searched=False),
+        llm_provider=provider, llm_model=model,
+        judge_metadata=judge_metadata, audit_metadata=audit_metadata,
+        search_status=status, verification_status=verification_status,
+        ai_provider=ident["ai_provider"], ai_model=ident["ai_model"],
+        anthropic_attempted=ident["anthropic_attempted"],
+        anthropic_succeeded=ident["anthropic_succeeded"],
+        fallback_used=ident["fallback_used"], llm_verified=False,
+        unverified_results_suppressed=suppressed,
     )
 
 
@@ -399,16 +527,41 @@ def load_search(db: Session, search_id: str) -> SearchResponse | None:
         external_searched = state.external_searched
         judge_metadata = state.judge_metadata
         audit_metadata = state.audit_metadata
-    else:
-        # Pre-PART-7 saved search — no snapshot row. Derive counts from the stored
-        # payload qualifications; metadata is unrecoverable, so leave it None and
-        # near_matches empty (V4 PART 7 §7).
-        exact_n = sum(1 for m in main_rows if m.qualification == Qualification.EXACT_MATCH)
-        possible_n = sum(1 for m in main_rows if m.qualification == Qualification.POSSIBLE_MATCH)
-        total_candidates = sq.total_candidates
-        external_searched = bool(sq.external_searched)
-        judge_metadata = None
-        audit_metadata = None
+        vm = getattr(state, "verification_metadata", None) or {}
+        search_status = getattr(state, "search_status", None) or SearchStatus.SUCCESS
+        # B38 — a persisted failed/incomplete search reloads with NO candidates,
+        # even if (defensively) result rows somehow exist.
+        if search_status not in RESULT_BEARING_STATUSES:
+            main_rows, near_rows = [], []
+            exact_n = possible_n = 0
+        return SearchResponse(
+            search_id=sq.id, query=sq.query_text,
+            interpreted_query=sq.interpreted_query_json or {},
+            connections=ConnectionBucket(
+                total_candidates=total_candidates, returned=len(main_rows), results=main_rows,
+                exact_match_count=exact_n, possible_match_count=possible_n, near_matches=near_rows,
+            ),
+            external=ExternalBucket(searched=bool(external_searched)),
+            llm_provider=sq.llm_provider, llm_model=sq.llm_model,
+            judge_metadata=judge_metadata, audit_metadata=audit_metadata,
+            search_status=search_status,
+            verification_status=vm.get("verification_status", VerificationStatus.NOT_REQUIRED),
+            ai_provider=vm.get("ai_provider"), ai_model=vm.get("ai_model"),
+            anthropic_attempted=bool(vm.get("anthropic_attempted")),
+            anthropic_succeeded=bool(vm.get("anthropic_succeeded")),
+            fallback_used=bool(vm.get("fallback_used")),
+            llm_verified=bool(vm.get("llm_verified")),
+            unverified_results_suppressed=int(vm.get("unverified_results_suppressed") or 0),
+        )
+    # Pre-PART-7 saved search — no snapshot row. Derive counts from the stored
+    # payload qualifications; metadata is unrecoverable, so leave it None and
+    # near_matches empty (V4 PART 7 §7).
+    exact_n = sum(1 for m in main_rows if m.qualification == Qualification.EXACT_MATCH)
+    possible_n = sum(1 for m in main_rows if m.qualification == Qualification.POSSIBLE_MATCH)
+    total_candidates = sq.total_candidates
+    external_searched = bool(sq.external_searched)
+    judge_metadata = None
+    audit_metadata = None
 
     return SearchResponse(
         search_id=sq.id,
