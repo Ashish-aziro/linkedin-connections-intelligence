@@ -39,6 +39,10 @@ def cross_encode(query: str, texts: list[str]) -> list[float]:
         return []
     if not settings.reranker_enabled:
         return [0.0] * len(texts)
+    from app.services import search_profile
+
+    search_profile.incr("cross_encoder_calls")
+    search_profile.incr("cross_encoder_pairs", len(texts))
     try:
         raw = _get_model().predict(
             [(query, t or "") for t in texts], batch_size=32, show_progress_bar=False

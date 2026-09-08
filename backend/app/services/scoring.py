@@ -89,6 +89,14 @@ class ScoringContext:
     company_class: dict[str, dict] = field(default_factory=dict)
     #: person_id -> {criterion_id: {"status","match_strength","confidence","reason","evidence"}}
     judge_results: dict[str, dict[str, dict]] = field(default_factory=dict)
+    #: (person_id, concept) -> concept-vs-career cross-encoder score in [0,1].
+    #: PRECOMPUTED in batches by ``semantic_similarity.compute_semantic_similarity``
+    #: — ``score_candidate`` only ever READS this, never invokes a model (STEP 2/3).
+    semantic_similarity: dict[tuple[str, str], float] = field(default_factory=dict)
+    #: person_id -> whole-profile embedding cosine in [0,1]. Precomputed in ONE
+    #: vectorised numpy matmul (STEP 7); ``_relevance_component`` reads it and
+    #: only falls back to a per-pair dot product for direct unit-test calls.
+    relevance_by_person: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -547,21 +555,17 @@ def _score_semantic_concept(
                     best_status = TriState.TRUE if _profile_can_be_true else TriState.UNKNOWN
                     best_ev = [EvidenceItem(type="semantic", text=f"{label}: {v}", detail={"inferred": True})]
 
-    # 3. concept-vs-career cross-encoder (criterion-level, not whole query, spec §26).
-    #    Skipped for role_function / industry_experience when we HAVE experience-
-    #    level semantics: structured role vs industry data is authoritative there,
-    #    and a fuzzy similarity must not turn a clean "no" into a maybe (V4 §H.5).
+    # 3. concept-vs-career similarity (criterion-level, not whole query, spec §26).
+    #    PURE: reads the PRECOMPUTED, batched cross-encoder score from ctx —
+    #    score_candidate never loads or calls a model (STEP 2/3). Skipped for
+    #    role_function / industry_experience when we HAVE experience-level
+    #    semantics: structured role vs industry data is authoritative there, and
+    #    a fuzzy similarity must not turn a clean "no" into a maybe (V4 §H.5).
     _structured_authoritative = bool(exp_sem) and crit.type in (
         CriterionType.ROLE_FUNCTION, CriterionType.INDUSTRY_EXPERIENCE)
-    if best_strength < 0.6 and settings.reranker_enabled and not _structured_authoritative:
-        try:
-            from app.services.reranker import cross_encode
-
-            snippet = _career_snippet(facts)
-            ce = cross_encode(concept, [snippet])[0] if snippet else 0.0
-        except Exception:  # noqa: BLE001
-            ce = 0.0
-        if ce >= 0.5:
+    if best_strength < 0.6 and not _structured_authoritative:
+        ce = ctx.semantic_similarity.get((facts.person.id, concept))
+        if ce is not None and ce >= 0.5:
             strength = 0.35 + ce * 0.3
             if strength > best_strength:
                 best_strength, best_ev, best_status = strength, [
@@ -803,7 +807,11 @@ def _cosine_norm(query_emb: bytes | None, profile_emb: bytes | None) -> float:
 
 
 def _relevance_component(facts: ProfileFacts, ctx: ScoringContext, weight: float) -> ScoreComponent:
-    emb = _cosine_norm(ctx.query_embedding, facts.embedding)
+    # STEP 7 — prefer the vectorised, precomputed cosine; fall back to a single
+    # dot product only for direct unit-test calls that never ran the batch pass.
+    emb = ctx.relevance_by_person.get(facts.person.id)
+    if emb is None:
+        emb = _cosine_norm(ctx.query_embedding, facts.embedding)
     ce = ctx.reranker_scores.get(facts.person.id)
     if ce is not None:
         strength = settings.rerank_blend * ce + (1 - settings.rerank_blend) * emb
@@ -842,6 +850,9 @@ def _effective_relevance_weight(parsed: ParsedSearchQuery) -> float:
 def score_candidate(
     facts: ProfileFacts, parsed: ParsedSearchQuery, ctx: ScoringContext | None = None
 ) -> ScoredCandidate:
+    from app.services import search_profile
+
+    search_profile.incr("score_candidate_calls")
     ctx = ctx or ScoringContext()
     components: list[ScoreComponent] = []
     all_evidence: list[EvidenceItem] = []

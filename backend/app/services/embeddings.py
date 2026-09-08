@@ -47,6 +47,9 @@ def _get_model():
 
 
 def embed_text(text: str) -> bytes:
+    from app.services import search_profile
+
+    search_profile.incr("embedding_calls")
     if not settings.embeddings_enabled:
         return _hash_vector(text).tobytes()
     try:
