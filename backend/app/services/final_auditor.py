@@ -38,52 +38,33 @@ from app.services.semantic_judge import _make_batches
 log = logging.getLogger("app.audit")
 
 _AUDIT_SYSTEM = (
-    "You are the FINAL CORRECTNESS AUDITOR for a professional-network search. A first pass has "
-    "already scored and ranked these candidates. Your job is a consistency review of the people "
-    "about to be shown to the user — NOT a new search and NOT a new score.\n\n"
-    "For EACH candidate, reason through:\n"
-    "  1. Did they actually satisfy EVERY required criterion?\n"
-    "  2. Are any 'true' criteria based on weak evidence or a semantic leap?\n"
-    "  3. Are different dimensions being conflated? e.g.\n"
-    "       technical role != tech-industry employer\n"
-    "       studied at a university != a faculty / professor appointment\n"
-    "       healthcare employer != personal HIPAA / compliance expertise\n"
-    "       senior engineer != evidence of mentoring or people leadership\n"
-    "       used AWS != employed by Amazon\n"
-    "       worked with / sold to CXOs != is a CXO\n"
-    "       one publication != a professor / career researcher\n"
-    "       advises startups != currently employed at a startup\n"
-    "  4. For a relational query ('who could mentor a backend engineer moving into "
-    "management') — does the person's actual career make sense for that need? "
-    "(IC->manager path, explicit mentoring, team leadership.) Relational fit CANNOT rescue a "
-    "failed required criterion.\n"
-    "  5. Is the current qualification (exact_match / possible_match / not_match) consistent "
-    "with the evidence?\n\n"
-    "FACTS ARE LOCKED. You cannot overturn a verified employer, past employer, location, "
-    "education record, employment date, career chronology, years of experience, a cached "
-    "high-confidence company classification, or a validated evidence reference. 'Atlanta is "
-    "close enough to Nashville' is NOT allowed.\n\n"
-    "For 'AND' / cross-domain queries (cybersecurity AND healthcare, AI AND healthcare, "
-    "research AND industry) BOTH dimensions must be individually supported.\n"
-    "For a criterion with modality 'possible', its absence must not make the candidate "
-    "incorrect — it may simply not be a verified expert.\n\n"
-    "DECISION per person:\n"
-    "  approved  — the existing qualification is supported by the evidence\n"
-    "  downgrade — relevant, but something treated as verified is actually uncertain "
-    "(e.g. exact -> possible)\n"
-    "  incorrect — at least one REQUIRED condition clearly fails; must not appear in results\n"
-    "  unknown   — you cannot reliably decide; be conservative\n\n"
-    "You do NOT set the final qualification — the backend does, and it will NEVER promote "
-    "possible -> exact from your review. Cite packet evidence references "
-    "(exp:/edu:/cert:/skill:/assertion:/company:/pub:/vol:/rec:) for every objection and "
-    "approval. Review EACH required criterion in `criteria`.\n\n"
-    "OUTPUT IS TRANSPORT ONLY, not a report: no long prose, no restating the evidence. A short "
-    "phrase of a few words is enough ONLY when it clarifies a downgrade/incorrect call — omit it "
-    "otherwise. Return JSON only, in exactly this shape: "
+    "You are the FINAL CORRECTNESS AUDITOR for a professional-network search. A first pass "
+    "already scored and ranked these candidates — this is a consistency review of the people "
+    "about to be shown, NOT a new search and NOT a new score.\n\n"
+    "For EACH candidate, for EACH required criterion, decide: is the first-pass conclusion "
+    "defensible from THIS packet's evidence? Watch for semantic leaps: a degree from a "
+    "university != a faculty appointment; used AWS != employed by Amazon; sold to CXOs != is a "
+    "CXO; one publication != a career researcher; a senior title != people-leadership evidence; "
+    "a healthcare employer != personal HIPAA expertise; advises startups != employed at one. "
+    "For an 'AND' / cross-domain query BOTH dimensions must be individually supported. A "
+    "'possible' modality criterion's absence never makes the candidate incorrect.\n\n"
+    "FACTS ARE LOCKED — you cannot overturn a verified employer, location, education record, "
+    "employment date, chronology, years of experience, a cached high-confidence company "
+    "classification, or a validated evidence ref. 'Atlanta ~ Nashville' is not allowed.\n\n"
+    "status_review per required criterion: supported | unsupported | uncertain.\n"
+    "decision per person: approved (qualification holds) | downgrade (something 'verified' is "
+    "actually uncertain) | incorrect (a required condition clearly fails) | unknown (cannot "
+    "decide — be conservative). You do NOT set the final qualification; the backend does and "
+    "NEVER promotes possible -> exact.\n\n"
+    "OUTPUT = TRANSPORT, NOT A REPORT. No prose, no restating evidence, no chain-of-thought. "
+    "OMIT \"contradicting_refs\" and \"reason\" unless non-empty; fill \"reason\" (<= 10 words) "
+    "ONLY for unsupported/uncertain/downgrade/incorrect. For an APPROVED candidate ALSO give "
+    "\"display_reason\": ONE plain sentence (<= 30 words) naming the concrete evidence that "
+    "satisfies the query — no praise, no adjectives like 'strong'/'great'. Return JSON only: "
     '{"people":[{"person_id":"...","decision":"approved|downgrade|incorrect|unknown","confidence":0-1,'
-    '"criteria":[{"criterion_id":"...","status_review":"supported|unsupported|uncertain",'
-    '"supporting_refs":["exp:.."],"contradicting_refs":[],"reason":""}]}]} '
-    "— one entry per person_id, one review per REQUIRED criterion at minimum."
+    '"display_reason":"","criteria":[{"criterion_id":"...","status_review":"supported|unsupported|uncertain",'
+    '"supporting_refs":["exp:.."]}]}]} '
+    "— one entry per person_id, one review per REQUIRED criterion."
 )
 
 
@@ -171,10 +152,14 @@ def run_final_audit(
     first_pass_by_id = {c.person.id: _first_pass(c, ctx) for c in audit_pool}
     payload = _audit_payload(query, parsed)
 
-    # criteria density -> proactive batch size (hardening PART 4, mirrors the judge)
+    # criteria density -> proactive batch size (B7/B8). Audit reviews cost more
+    # output per criterion than a compact judge verdict, so size for THAT.
+    from app.services.llm.token_estimate import _PER_AUDIT_CRITERION_TOKENS
+
     req_counts = [sum(1 for c in parsed.criteria if c.required) or 1 for _ in packets]
     avg_criteria = (sum(req_counts) / len(req_counts)) if req_counts else 1.0
-    planned_size = plan_batch_size(settings.final_result_audit_batch_size, avg_criteria)
+    planned_size = plan_batch_size(settings.final_result_audit_batch_size, avg_criteria,
+                                   per_criterion=_PER_AUDIT_CRITERION_TOKENS)
     batches, oversized = _make_batches(
         packets,
         size=planned_size,
@@ -322,6 +307,9 @@ def _expand_compact_audit(pd) -> dict:
         "decision": pd.decision,
         "confidence": pd.confidence,
         "reason": "",
+        #: B11 — kept only for an approved decision; validated + used as the
+        #: display reason so no separate reason-generation call is needed.
+        "display_reason": (pd.display_reason or "").strip() if pd.decision == AuditDecision.APPROVED else "",
         "criteria": [
             {
                 "criterion_id": cr.criterion_id, "status_review": cr.status_review,

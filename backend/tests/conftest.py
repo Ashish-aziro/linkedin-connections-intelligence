@@ -11,15 +11,24 @@ os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB.as_posix()}"
 os.environ["USE_FIXTURES"] = "true"
 os.environ["ENVIRONMENT"] = "development"
 os.environ["EMBEDDINGS_ENABLED"] = "false"
+os.environ["WARM_MODELS_ON_STARTUP"] = "false"  # B5 — tests never load real model weights
 os.environ["SEMANTIC_ENABLED"] = "false"
 os.environ["LLM_QUERY_INTERPRETATION"] = "false"
 os.environ["LLM_REASON_GENERATION"] = "false"
+# V4 PART 6 B2 — the general suite runs with LLM disabled, so it exercises the
+# deterministic pipeline directly; the "no LLM ⇒ no results" gate is off here and
+# the dedicated B2 tests turn it on + mock a successful LLM plan.
+os.environ["REQUIRE_LLM_FOR_RESULTS"] = "false"
 # V4 PART 5 — the final audit is an LLM path; off by default in tests (like the
 # reason generator). Audit tests enable it and mock final_auditor._audit_batch.
 os.environ["FINAL_RESULT_AUDIT_ENABLED"] = "false"
 os.environ["DEVELOPMENT_BATCH_SIZE"] = "3"
-os.environ.setdefault("GROQ_API_KEY", "")
-os.environ.setdefault("APIFY_API_TOKEN", "")
+# No test may make a live LLM / Apify call (B41). Every LLM key is hard-cleared
+# here; a test that needs one monkeypatches ``settings.<key>`` for its scope.
+os.environ["ANTHROPIC_API_KEY"] = ""
+os.environ["GROQ_API_KEY"] = ""
+os.environ["OPENROUTER_API_KEY"] = ""
+os.environ["APIFY_API_TOKEN"] = ""
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

@@ -122,9 +122,12 @@ def test_all_viable_candidates_are_judged_in_batches(monkeypatch):
         network_size=991, pool_size=991, hard_rejected_count=0,
     )
     assert run.metadata.judge_candidate_count == 100
-    assert run.metadata.judge_batch_count == 10           # NOT 60, NOT ambiguity-band
-    assert len(calls) == 10
-    assert sum(len(c["packets"]) for c in calls) == 100
+    # batched (NOT 1/candidate, NOT an ambiguity-band shortlist) — exact batch
+    # size is criteria-density-driven (B8), so assert the invariants:
+    assert 1 < run.metadata.judge_batch_count <= 34       # << 100 (batched) and > 1
+    assert len(calls) == run.metadata.judge_batch_count
+    assert sum(len(c["packets"]) for c in calls) == 100   # every viable candidate judged
+    assert max(len(c["packets"]) for c in calls) <= 10    # never exceeds the configured size
     assert run.metadata.judge_status == JudgeStatus.FULL
     assert len(run.verdicts) == 100
     assert all("mentor_evidence" in v for v in run.verdicts.values())
@@ -162,9 +165,13 @@ def test_partial_batch_failure_keeps_earlier_verdicts(monkeypatch):
               if not v["mentor_evidence"].get("judge_missing")]
     unjudged = [pid for pid, v in run.verdicts.items()
                 if v["mentor_evidence"].get("judge_missing")]
-    assert len(judged) == 60 and len(unjudged) == 40
+    # first 6 batches succeed, the rest fail — batch size depends on criteria
+    # density (B8), so assert the RELATIONSHIP, not a fixed count.
+    assert len(judged) + len(unjudged) == 100
+    assert 0 < len(judged) < 100 and len(unjudged) > 0
     assert run.metadata.judge_status == JudgeStatus.PARTIAL
-    assert run.metadata.judge_successful_batches == 6 and run.metadata.judge_failed_batches == 4
+    assert run.metadata.judge_successful_batches == 6
+    assert run.metadata.judge_failed_batches == run.metadata.judge_batch_count - 6
     assert all(run.verdicts[pid]["mentor_evidence"]["status"] == TriState.UNKNOWN for pid in unjudged)
 
 
@@ -282,10 +289,11 @@ def test_deadline_reached_stops_further_batches_and_marks_partial(monkeypatch):
     )
     assert run.metadata.deadline_reached is True
     assert run.metadata.judge_status == JudgeStatus.PARTIAL
-    assert run.metadata.judge_batch_count == 3
+    assert run.metadata.judge_batch_count == 3  # 3 batches attempted, then the deadline check stops the loop
     judged = [pid for pid, v in run.verdicts.items() if not v["mentor_evidence"].get("judge_missing")]
     unjudged = [pid for pid, v in run.verdicts.items() if v["mentor_evidence"].get("judge_missing")]
-    assert len(judged) == 30 and len(unjudged) == 70
+    assert len(judged) + len(unjudged) == 100
+    assert 0 < len(judged) < 100 and len(unjudged) > 0
     assert all(run.verdicts[pid]["mentor_evidence"]["status"] == TriState.UNKNOWN for pid in unjudged)
 
 

@@ -1,16 +1,65 @@
 import { useState } from "react";
-import { Link, useLocation, useParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle } from "lucide-react";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { AlertTriangle, ShieldCheck, ShieldOff } from "lucide-react";
 import { api } from "../api/client";
 import type { SearchResponse } from "../api/types";
 import { ResultCard } from "../components/ResultCard";
-import { Badge, Card } from "../components/ui";
+import { Badge, Button, Card } from "../components/ui";
+
+const FAILED_STATUSES = new Set(["verification_incomplete", "ai_unavailable"]);
+
+function VerificationBanner({ res }: { res: SearchResponse }) {
+  const status = res.search_status ?? "success";
+  if (status === "success") {
+    const name = res.ai_model || "Claude";
+    return (
+      <div className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700 ring-1 ring-emerald-200">
+        <ShieldCheck size={13} /> Verified by {name}
+      </div>
+    );
+  }
+  if (status === "success_with_fallback") {
+    return (
+      <div className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 text-xs font-medium text-amber-800 ring-1 ring-amber-200">
+        <ShieldCheck size={13} /> Verified by fallback AI provider
+      </div>
+    );
+  }
+  return null;
+}
+
+function VerificationFailed({ res, datasetId }: { res: SearchResponse; datasetId: string }) {
+  const nav = useNavigate();
+  const retry = useMutation({
+    mutationFn: () => api.search(datasetId, res.query),
+    onSuccess: (r) => nav(`/datasets/${datasetId}/search/${r.search_id}`, { state: r, replace: true }),
+  });
+  const unavailable = res.search_status === "ai_unavailable";
+  return (
+    <Card className="mt-6 px-6 py-8 text-center">
+      <ShieldOff size={22} className="mx-auto text-ink-faint" />
+      <h2 className="mt-3 text-sm font-semibold text-ink">
+        {unavailable ? "AI search is temporarily unavailable" : "AI verification could not be completed"}
+      </h2>
+      <p className="mx-auto mt-1.5 max-w-md text-sm text-ink-soft">
+        {unavailable
+          ? "The AI that interprets and verifies searches did not respond. No results were returned."
+          : "No unverified results were returned. Deterministic matches are never shown as verified matches."}
+      </p>
+      <div className="mt-4">
+        <Button onClick={() => retry.mutate()} disabled={retry.isPending}>
+          {retry.isPending ? "Retrying…" : "Retry Search"}
+        </Button>
+      </div>
+      {retry.error && <p className="mt-2 text-xs text-red-600">{String(retry.error)}</p>}
+    </Card>
+  );
+}
 
 type JudgeMeta = NonNullable<SearchResponse["judge_metadata"]>;
 type AuditMeta = NonNullable<SearchResponse["audit_metadata"]>;
 
-const DEGRADED = new Set(["partial", "unavailable"]);
 
 function InterpretationPanel({ res }: { res: SearchResponse }) {
   const iq = res.interpreted_query ?? {};
@@ -133,9 +182,11 @@ export default function ResultsPage() {
 
   const conn = res.connections;
   const nearMatches = conn.near_matches ?? [];
-  const verificationDegraded =
-    DEGRADED.has(res.judge_metadata?.status ?? "") ||
-    (res.audit_metadata?.enabled === true && DEGRADED.has(res.audit_metadata?.status ?? ""));
+  const failed = FAILED_STATUSES.has(res.search_status ?? "success");
+  // a completed search whose verification the query needed but did not fully get
+  // (e.g. deadline hit mid-audit) — results ARE shown, with an honest note.
+  const verificationPartial =
+    !failed && res.verification_status === "incomplete";
 
   return (
     <div>
@@ -145,6 +196,12 @@ export default function ResultsPage() {
 
       <h1 className="mt-3 text-xl font-semibold">&ldquo;{res.query}&rdquo;</h1>
 
+      <VerificationBanner res={res} />
+
+      {failed ? (
+        <VerificationFailed res={res} datasetId={datasetId} />
+      ) : (
+        <>
       <InterpretationPanel res={res} />
 
       {res.interpreted_query?.criteria?.length > 0 && (
@@ -166,10 +223,13 @@ export default function ResultsPage() {
         </div>
       )}
 
-      {verificationDegraded && (
+      {verificationPartial && (
         <div className="mt-4 flex items-start gap-2 rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 ring-1 ring-amber-200">
           <AlertTriangle size={15} className="mt-0.5 shrink-0" />
-          <span>Some AI verification was unavailable; uncertain results are shown conservatively.</span>
+          <span>
+            AI verification finished only partially (time budget reached). Some matches below
+            may not be fully verified.
+          </span>
         </div>
       )}
 
@@ -214,6 +274,8 @@ export default function ResultsPage() {
       )}
 
       <SearchQualityDetails judge={res.judge_metadata} audit={res.audit_metadata} />
+        </>
+      )}
     </div>
   );
 }

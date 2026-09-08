@@ -139,57 +139,73 @@ describe("ResultsPage", () => {
     expect(screen.getByText(/Missing: CXO-level seniority/)).toBeInTheDocument();
   });
 
-  it("warns when final audit verification was partial", () => {
-    renderPage(
-      response({
-        audit_metadata: {
-          enabled: true,
-          status: "partial",
-          requested_candidates: 5,
-          audited_candidates: 3,
-          batch_count: 2,
-          successful_batches: 1,
-          failed_batches: 1,
-          oversized_packets: 0,
-          approved: 2,
-          downgraded: 1,
-          incorrect: 0,
-          unknown: 0,
-          missing_required_reviews: 0,
-          candidates_with_incomplete_reviews: 0,
-          providers: {},
-          models: [],
-        },
-      }),
-    );
-    expect(
-      screen.getByText(/Some AI verification was unavailable; uncertain results are shown conservatively/),
-    ).toBeInTheDocument();
+  it("notes a partial verification when the deadline was hit mid-verification", () => {
+    renderPage(response({ search_status: "success", verification_status: "incomplete" }));
+    expect(screen.getByText(/AI verification finished only partially/)).toBeInTheDocument();
   });
 
-  it("does not warn when verification was full", () => {
+  it("shows a 'Verified by' banner and no partial note when verification was complete", () => {
+    renderPage(
+      response({ search_status: "success", verification_status: "complete", ai_model: "Claude Sonnet 5" }),
+    );
+    expect(screen.getByText(/Verified by Claude Sonnet 5/)).toBeInTheDocument();
+    expect(screen.queryByText(/AI verification finished only partially/)).not.toBeInTheDocument();
+  });
+
+  it("renders NO candidate cards when AI verification could not be completed", () => {
     renderPage(
       response({
-        judge_metadata: {
-          mode: "all_viable",
-          status: "full",
-          network_size: 100,
-          candidate_pool_size: 50,
-          hard_fact_rejected_count: 10,
-          viable_candidate_count: 40,
-          judge_candidate_count: 40,
-          judge_batch_count: 8,
-          judge_successful_batches: 8,
-          judge_failed_batches: 0,
-          capped: false,
-          omitted_people: 0,
-          omitted_criteria: 0,
-          providers: {},
-          models: [],
+        search_status: "verification_incomplete",
+        verification_status: "incomplete",
+        connections: {
+          total_candidates: 16,
+          returned: 0,
+          results: [],
+          exact_match_count: 0,
+          possible_match_count: 0,
+          near_matches: [],
         },
       }),
     );
-    expect(screen.queryByText(/Some AI verification was unavailable/)).not.toBeInTheDocument();
+    expect(screen.getByText(/AI verification could not be completed/)).toBeInTheDocument();
+    expect(screen.getByText(/No unverified results were returned/)).toBeInTheDocument();
+    expect(screen.getByText("Retry Search")).toBeInTheDocument();
+    expect(screen.queryByText("Person")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Search quality details/)).not.toBeInTheDocument();
+  });
+
+  it("shows the AI-unavailable state distinctly", () => {
+    renderPage(response({ search_status: "ai_unavailable", verification_status: "incomplete" }));
+    expect(screen.getByText(/AI search is temporarily unavailable/)).toBeInTheDocument();
+    expect(screen.getByText("Retry Search")).toBeInTheDocument();
+  });
+
+  it("labels a fallback-verified search", () => {
+    renderPage(response({ search_status: "success_with_fallback" }));
+    expect(screen.getByText(/Verified by fallback AI provider/)).toBeInTheDocument();
+  });
+
+  const _judgeFull = {
+    mode: "all_viable" as const,
+    status: "full" as const,
+    network_size: 100,
+    candidate_pool_size: 50,
+    hard_fact_rejected_count: 10,
+    viable_candidate_count: 40,
+    judge_candidate_count: 40,
+    judge_batch_count: 8,
+    judge_successful_batches: 8,
+    judge_failed_batches: 0,
+    capped: false,
+    omitted_people: 0,
+    omitted_criteria: 0,
+    providers: {},
+    models: [],
+  };
+
+  it("does not show the partial note when verification was full", () => {
+    renderPage(response({ judge_metadata: _judgeFull, verification_status: "complete" }));
+    expect(screen.queryByText(/AI verification finished only partially/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByText(/Search quality details/));
     expect(screen.getByText("Semantic review")).toBeInTheDocument();
   });
