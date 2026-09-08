@@ -48,8 +48,10 @@ from app.services.person_view import education_to_out, experience_to_out, skill_
 from app.services.profile_authority import current_employer_from
 from app.services.query_interpreter import interpret_query
 from app.services.reason_generator import generate_reason, generate_reasons_batch
+from app.services import search_profile
 from app.services.scoring import ScoredCandidate, ScoringContext, load_facts, score_candidate
 from app.services.semantic_judge import run_judge
+from app.services.semantic_similarity import compute_semantic_similarity
 
 log = logging.getLogger("app.search")
 
@@ -65,10 +67,17 @@ def _tier_key(s):
 
 def run_connection_search(db: Session, *, dataset_id: str, query: str) -> SearchResponse:
     llm_budget.clear_budget()  # defensive — a prior request on a reused thread must never leak in
-    # hardening PART 14 — wall-clock budget for OPTIONAL LLM work (judge / audit
-    # / reason). Deterministic scoring below is never skipped for time.
+    import time as _time
+
+    prof = search_profile.start()
+    _wall_start = _time.perf_counter()
+    # hardening PART 14 / mission STEP 9 — ONE wall-clock budget for the whole
+    # search. Deterministic scoring always runs to completion; every OPTIONAL
+    # expensive stage (similarity, judge, rerank, audit, reason) checks it and
+    # bails to fast partial finalization once it is spent.
     deadline = Deadline(settings.search_max_seconds)
-    parsed, provider, model = interpret_query(query)
+    with prof.stage("query_interpretation"):
+        parsed, provider, model = interpret_query(query)
     log.info("query %r -> %d criteria (intent=%s) via %s",
              query, len(parsed.criteria), parsed.intent, provider)
 
@@ -78,43 +87,63 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     llm_budget.start_budget(settings.search_llm_max_calls)
     calls_interpretation = 0 if provider == "deterministic" else 1
 
-    query_embedding = _maybe_embed(query)  # for relevance RANKING only — never gates
-    candidates, total = get_candidates(db, dataset_id, parsed, query_embedding)
+    with prof.stage("query_embedding"):
+        query_embedding = _maybe_embed(query)  # for relevance RANKING only — never gates
+    with prof.stage("candidate_fetch"):
+        candidates, total = get_candidates(db, dataset_id, parsed, query_embedding)
     pids = [p.id for p in candidates]
 
     # bulk-load every fact once (spec §31 / PART 3 §58 — no per-candidate N+1)
-    facts_cache = {
-        "experiences": repo.bulk_experiences(db, pids),
-        "education": repo.bulk_education(db, pids),
-        "skills": repo.bulk_skills(db, pids),
-        "certifications": repo.bulk_certifications(db, pids),
-        "languages": repo.bulk_languages(db, pids),
-        "publications": repo.bulk_publications(db, pids),
-        "semantics": repo.bulk_semantics(db, pids),
-        "embeddings": repo.bulk_embeddings_by_person(db, pids),
-    }
-    vol_by_id = repo.bulk_volunteering(db, pids)
-    rec_by_id = repo.bulk_recommendations(db, pids)
+    with prof.stage("bulk_fact_load"):
+        facts_cache = {
+            "experiences": repo.bulk_experiences(db, pids),
+            "education": repo.bulk_education(db, pids),
+            "skills": repo.bulk_skills(db, pids),
+            "certifications": repo.bulk_certifications(db, pids),
+            "languages": repo.bulk_languages(db, pids),
+            "publications": repo.bulk_publications(db, pids),
+            "semantics": repo.bulk_semantics(db, pids),
+            "embeddings": repo.bulk_embeddings_by_person(db, pids),
+        }
+        vol_by_id = repo.bulk_volunteering(db, pids)
+        rec_by_id = repo.bulk_recommendations(db, pids)
 
-    ctx = ScoringContext(
-        query_embedding=query_embedding,
-        company_ids_by_criterion=_resolve_company_ids(db, dataset_id, parsed),
-        company_class=_pool_company_class(db, parsed, facts_cache["experiences"]),
-    )
+    with prof.stage("company_classification"):
+        ctx = ScoringContext(
+            query_embedding=query_embedding,
+            company_ids_by_criterion=_resolve_company_ids(db, dataset_id, parsed),
+            company_class=_pool_company_class(db, parsed, facts_cache["experiences"]),
+        )
     facts_by_id: dict = {p.id: load_facts(db, p, facts_cache) for p in candidates}
 
     # ── hard-fact viability gate (V4 PART 3 §4-§7) ────────────────────
-    decisions = {p.id: hard_gate(facts_by_id[p.id], parsed, ctx) for p in candidates}
+    with prof.stage("hard_gate"):
+        decisions = {p.id: hard_gate(facts_by_id[p.id], parsed, ctx) for p in candidates}
     viable = [p for p in candidates if decisions[p.id].viable]
     hard_rejected = [p for p in candidates if not decisions[p.id].viable]
     log.info("hard-fact gate: %d viable, %d rejected (of %d scanned)",
              len(viable), len(hard_rejected), total)
 
+    # ── STEP 7 — ONE vectorised numpy matmul for whole-profile relevance,
+    #    instead of a per-candidate dot product inside every score_candidate. ──
+    _precompute_relevance(ctx, [facts_by_id[p.id] for p in viable])
+
+    # ── STEP 3/4 — batched concept-vs-career cross-encoder for the viable set
+    #    (ONE predict() per distinct concept, not one pair per candidate). Skipped
+    #    once the deadline is spent — ranking degrades, the search never hangs. ──
+    with prof.stage("semantic_similarity"):
+        if not deadline.expired():
+            compute_semantic_similarity(
+                [facts_by_id[p.id] for p in viable], parsed, ctx, deadline=deadline
+            )
+
     # ── local pre-score the viable set — evidence / prior signal only,
     #    NOT a filter, MIN_MATCH_SCORE deliberately not applied (§21/§22) ──
-    prescored: dict[str, ScoredCandidate] = {
-        p.id: score_candidate(facts_by_id[p.id], parsed, ctx) for p in viable
-    }
+    with prof.stage("prescore"):
+        prescored: dict[str, ScoredCandidate] = {
+            p.id: score_candidate(facts_by_id[p.id], parsed, ctx) for p in viable
+        }
+    prof.incr("prescore_candidates", len(viable))
 
     # ── exhaustive semantic judge (§8-§10) ───────────────────────────
     bundle = [
@@ -122,39 +151,55 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
          {"volunteering": vol_by_id.get(p.id, []), "recommendations": rec_by_id.get(p.id, [])})
         for p in viable
     ]
-    judge_run = run_judge(
-        query, parsed, bundle, ctx,
-        network_size=total, pool_size=len(candidates),
-        hard_rejected_count=len(hard_rejected), local_scored=prescored,
-        deadline=deadline,
-    )
+    with prof.stage("judge"):
+        judge_run = run_judge(
+            query, parsed, bundle, ctx,
+            network_size=total, pool_size=len(candidates),
+            hard_rejected_count=len(hard_rejected), local_scored=prescored,
+            deadline=deadline,
+        )
 
     # ── validate every verdict before it can change a score (§17) ────
-    for pid, person_verdicts in judge_run.verdicts.items():
-        packet = judge_run.packets_by_id.get(pid)
-        if packet is None or pid not in facts_by_id:
-            continue
-        validated = validate_person(person_verdicts, packet, parsed, facts_by_id[pid], ctx)
-        if validated:
-            ctx.judge_results[pid] = validated
+    with prof.stage("judge_validation"):
+        for pid, person_verdicts in judge_run.verdicts.items():
+            packet = judge_run.packets_by_id.get(pid)
+            if packet is None or pid not in facts_by_id:
+                continue
+            validated = validate_person(person_verdicts, packet, parsed, facts_by_id[pid], ctx)
+            if validated:
+                ctx.judge_results[pid] = validated
 
-    # ── deterministic rescore with the validated verdicts (authoritative) ──
-    scored: list[ScoredCandidate] = []
-    near_pool: list[ScoredCandidate] = []
-    for p in viable:
-        r = score_candidate(facts_by_id[p.id], parsed, ctx)
-        if r.qualification == Qualification.NOT_MATCH:
-            if len(r.unmet_required) == 1:
+    # ── deterministic rescore (STEP 5) — ONLY the candidates whose validated
+    #    judge verdicts can actually move something are recomputed; everyone
+    #    else reuses their (immutable) pre-score. A verdict changes the score
+    #    solely through ``scoring._score_one``'s judge-override branch, which
+    #    fires only on a TRUE/FALSE status for a judge-overridable type — an
+    #    all-UNKNOWN verdict leaves the deterministic score byte-identical, so
+    #    those candidates keep their pre-score (no second full N pass). ──
+    from app.constants import TriState as _TriState
+
+    changed_ids = {
+        pid for pid, vv in ctx.judge_results.items()
+        if any((v or {}).get("status") in (_TriState.TRUE, _TriState.FALSE) for v in vv.values())
+    }
+    prof.incr("rescore_candidates", len(changed_ids & {p.id for p in viable}))
+    with prof.stage("rescore"):
+        scored: list[ScoredCandidate] = []
+        near_pool: list[ScoredCandidate] = []
+        for p in viable:
+            r = score_candidate(facts_by_id[p.id], parsed, ctx) if p.id in changed_ids else prescored[p.id]
+            if r.qualification == Qualification.NOT_MATCH:
+                if len(r.unmet_required) == 1:
+                    near_pool.append(r)
+                continue
+            scored.append(r)
+
+        # hard-rejected candidates that miss only one thing — surfaced as near-matches,
+        # never judged, never in the main results
+        for p in hard_rejected:
+            r = score_candidate(facts_by_id[p.id], parsed, ctx)
+            if r.qualification == Qualification.NOT_MATCH and len(r.unmet_required) <= 2:
                 near_pool.append(r)
-            continue
-        scored.append(r)
-
-    # hard-rejected candidates that miss only one thing — surfaced as near-matches,
-    # never judged, never in the main results
-    for p in hard_rejected:
-        r = score_candidate(facts_by_id[p.id], parsed, ctx)
-        if r.qualification == Qualification.NOT_MATCH and len(r.unmet_required) <= 2:
-            near_pool.append(r)
 
     # ── NOW apply MIN_MATCH_SCORE (never before the judge, §22). A verified
     #    EXACT_MATCH is kept even with a modest numeric score. ──
@@ -164,28 +209,36 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     ]
     scored.sort(key=_tier_key)
 
-    # ── cross-encoder rerank WITHIN tiers (§37) ──────────────────────
+    # ── cross-encoder rerank WITHIN tiers (§37) — a small, bounded pool
+    #    (rerank_pool), skipped once the deadline is spent (STEP 9/10). ──
     pool = scored[: settings.rerank_pool]
-    if settings.reranker_enabled and pool:
+    if settings.reranker_enabled and pool and not deadline.expired():
         from app.services.reranker import cross_encode
 
-        texts = [_candidate_text(db, c, facts_by_id) for c in pool]
-        for c, ce in zip(pool, cross_encode(query, texts)):
-            ctx.reranker_scores[c.person.id] = ce
-        rescored = [score_candidate(facts_by_id[c.person.id], parsed, ctx) for c in pool]
-        rescored = [r for r in rescored if r.qualification != Qualification.NOT_MATCH]
-        rescored.sort(key=_tier_key)
-        scored = rescored + scored[settings.rerank_pool :]
-        scored.sort(key=_tier_key)  # cross-encoder must NOT reorder across tiers (V4 §25/§37)
+        with prof.stage("rerank"):
+            texts = [_candidate_text(db, c, facts_by_id) for c in pool]
+            for c, ce in zip(pool, cross_encode(query, texts)):
+                ctx.reranker_scores[c.person.id] = ce
+            rescored = [score_candidate(facts_by_id[c.person.id], parsed, ctx) for c in pool]
+            rescored = [r for r in rescored if r.qualification != Qualification.NOT_MATCH]
+            rescored.sort(key=_tier_key)
+            scored = rescored + scored[settings.rerank_pool :]
+            scored.sort(key=_tier_key)  # cross-encoder must NOT reorder across tiers (V4 §25/§37)
 
     # ── FINAL RESULT AUDIT (V4 PART 5) — one grounded LLM correctness pass over
     #    the TOP_N + BUFFER pool, BEFORE reason generation / persistence. It can
     #    only keep / downgrade / remove, never upgrade POSSIBLE->EXACT. Removed
     #    candidates drop out; the un-audited tail is kept only for the counts and
-    #    is NEVER promoted into the shown results (§3/§23). ────────────────────
-    audit_run, audit_by_id, survivors, tail = _run_final_audit(
-        db, query, parsed, scored, near_pool, ctx, facts_by_id, vol_by_id, rec_by_id, deadline,
-    )
+    #    is NEVER promoted into the shown results (§3/§23). Skipped entirely once
+    #    the deadline is spent — fast partial finalization (STEP 10). ──────────
+    if deadline.expired():
+        log.warning("search %r: deadline spent before final audit — finalizing PARTIAL", query)
+        audit_run, audit_by_id, survivors, tail = None, {}, scored, []
+    else:
+        with prof.stage("audit"):
+            audit_run, audit_by_id, survivors, tail = _run_final_audit(
+                db, query, parsed, scored, near_pool, ctx, facts_by_id, vol_by_id, rec_by_id, deadline,
+            )
     scored = survivors + tail
 
     total_scored = len(scored)
@@ -216,9 +269,10 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
         top[: settings.llm_reason_top_n]
         if settings.llm_reason_generation and not deadline.expired() else []
     )
-    reasons_by_id = (
-        generate_reasons_batch(llm_reason_pool, query, facts_by_id=facts_by_id) if llm_reason_pool else {}
-    )
+    with prof.stage("reason_generation"):
+        reasons_by_id = (
+            generate_reasons_batch(llm_reason_pool, query, facts_by_id=facts_by_id) if llm_reason_pool else {}
+        )
 
     results: list[SearchResultItem] = []
     for rank, cand in enumerate(top, start=1):
@@ -273,11 +327,17 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     llm_calls["deadline"] = deadline.as_dict()
     llm_budget.clear_budget()
 
+    prof.timings_ms["total"] = round((_time.perf_counter() - _wall_start) * 1000.0, 1)
+    profile_dict = prof.as_dict()
+    llm_calls["profile"] = profile_dict
+    search_profile.clear()
+
     log.info(
         "search %r done: llm_calls=%d elapsed_ms=%d deadline_s=%s deadline_reached=%s "
-        "judge_status=%s audit_status=%s",
+        "judge_status=%s audit_status=%s | stage_ms=%s counters=%s",
         query, llm_calls["total"], deadline.elapsed_ms(), deadline.seconds, deadline.expired(),
         judge_metadata.get("status"), (audit_metadata or {}).get("status"),
+        profile_dict["timings_ms"], profile_dict["counters"],
     )
 
     # FINAL validated search-level snapshot (V4 PART 7 §3) — captured here, AFTER
@@ -533,6 +593,35 @@ def _maybe_embed(query: str) -> bytes | None:
     except Exception:  # noqa: BLE001
         log.warning("query embedding failed — continuing without semantic prefilter", exc_info=False)
         return None
+
+
+def _precompute_relevance(ctx: ScoringContext, facts_list: list) -> None:
+    """STEP 7 — whole-profile relevance for the viable set in ONE numpy matmul,
+    stored on ``ctx.relevance_by_person``. Mirrors ``scoring._cosine_norm``
+    (normalised vectors -> dot product, /0.6, clamped to [0,1]); a vector whose
+    shape disagrees with the query is skipped (never a meaningless score)."""
+    if not ctx.query_embedding or not facts_list:
+        return
+    import numpy as np
+
+    from app.services.embeddings import to_array
+
+    q = to_array(ctx.query_embedding)
+    ids: list[str] = []
+    mat: list = []
+    for f in facts_list:
+        if not f.embedding:
+            continue
+        v = to_array(f.embedding)
+        if v.shape != q.shape:
+            continue
+        ids.append(f.person.id)
+        mat.append(v)
+    if not mat:
+        return
+    sims = np.dot(np.vstack(mat), q) / 0.6
+    for pid, s in zip(ids, sims):
+        ctx.relevance_by_person[pid] = float(max(0.0, min(1.0, s)))
 
 
 def _to_result_item(

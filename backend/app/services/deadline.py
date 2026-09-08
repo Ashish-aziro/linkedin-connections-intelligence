@@ -14,17 +14,21 @@ import time
 
 class Deadline:
     def __init__(self, seconds: float | None):
-        self._start = time.monotonic()
+        # perf_counter, not monotonic: it is also monotonic but has the highest
+        # available resolution on every platform. On Windows time.monotonic()
+        # can have a ~15 ms granularity, coarse enough that a sub-second search
+        # never observes the deadline as expired (mission STEP 9).
+        self._start = time.perf_counter()
         self.seconds = seconds if seconds and seconds > 0 else None
 
     def elapsed_ms(self) -> int:
-        return int((time.monotonic() - self._start) * 1000)
+        return int((time.perf_counter() - self._start) * 1000)
 
     def remaining(self) -> float | None:
         """Seconds left, or ``None`` when unlimited."""
         if self.seconds is None:
             return None
-        return self.seconds - (time.monotonic() - self._start)
+        return self.seconds - (time.perf_counter() - self._start)
 
     def expired(self) -> bool:
         r = self.remaining()
