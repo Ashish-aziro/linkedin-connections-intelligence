@@ -122,15 +122,16 @@ class Settings(BaseSettings):
     #: hit, remaining optional work is skipped, deterministic results stand, and
     #: unresolved conditions stay UNKNOWN with judge/audit status PARTIAL.
     search_llm_max_calls: int = 0
-    #: V4 PART 6 B9 — ONE end-to-end request budget. Every expensive stage checks
-    #: ``deadline.remaining()`` and will not start work that cannot finish. If it
-    #: expires BEFORE required AI verification completes the search returns
-    #: VERIFICATION_INCOMPLETE with results=[] (never deterministic fallback).
-    #: Measured: a fully-verified Sonnet-5 search (interp + exhaustive judge +
-    #: grounded audit) on the ~1k dataset runs ~60–120 s, so this is a generous
-    #: runaway-protection ceiling, NOT a tight interactive SLA — see the PART 6
-    #: report for the honest latency numbers. <= 0 disables it (tests).
-    search_max_seconds: float = 200.0
+    #: OPTIONAL end-to-end request budget. ``<= 0`` (the default) means NO
+    #: application-level search deadline: a broad semantic query keeps processing
+    #: every required judge batch and the final audit until verification finishes,
+    #: however long that takes. A POSITIVE value is an operator-configured safety
+    #: ceiling — every expensive stage checks ``deadline.remaining()`` and will not
+    #: start work it cannot finish; if it expires BEFORE required AI verification
+    #: completes the search returns VERIFICATION_INCOMPLETE with results=[] (never
+    #: a deterministic fallback). Elapsed wall time alone never causes a failure
+    #: status when this is 0 — only real provider failures do.
+    search_max_seconds: float = 0.0
 
     # ── Search quality v2 ────────────────────────────────────
     relevance_weight: float = 20.0         # points reserved for whole-profile relevance

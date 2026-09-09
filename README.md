@@ -135,9 +135,9 @@ regex parser, a required semantic judge produced no valid verdicts, or a require
 final audit did not finish — the search returns `search_status=ai_unavailable` or
 `verification_incomplete` with `results=[]` and `near_matches=[]`. **No required AI
 verification ⇒ no user-visible search results** — deterministic matches are never
-shown as verified ones. (`SEARCH_LLM_MAX_CALLS` / `SEARCH_MAX_SECONDS` are a softer
-control: once the query's required verification has succeeded, hitting the cap only
-skips remaining *optional* work and the response is marked partial.)
+shown as verified ones. (`SEARCH_LLM_MAX_CALLS` is a softer control: once the query's
+required verification has succeeded, hitting the cap only skips remaining *optional*
+work and the response is marked partial.)
 
 Because most candidates are already decided from stored facts and semantics, a
 ~1,000-connection network does **not** turn a broad query into ~100 Anthropic calls —
@@ -146,10 +146,18 @@ only the genuinely ambiguous candidates reach the judge. An optional
 query's required verification has succeeded, hitting the cap only skips remaining
 optional work and the UI marks verification as partial — it never silently pretends a
 review was complete, and it never resurrects unverified results if required
-verification had NOT succeeded. `SEARCH_MAX_SECONDS` is the same idea for wall time:
-new judge/audit batches stop starting once the deadline passes; if that happens before
-required verification finished, the search returns `verification_incomplete` with no
-results rather than hanging.
+verification had NOT succeeded.
+
+`SEARCH_MAX_SECONDS=0` (the default) means **no application-level search deadline**:
+a broad semantic query keeps processing every required judge batch and the final
+audit until verification finishes — elapsed wall time alone never causes
+`verification_incomplete` / `ai_unavailable`, only real provider failures do. A very
+broad query can therefore take several minutes and many LLM calls; no search is
+promised to finish within any fixed time. A **positive** `SEARCH_MAX_SECONDS` is an
+optional operator-configured safety ceiling: new judge/audit batches stop starting
+once it passes, and if that happens before required verification finished the search
+returns `verification_incomplete` with no results rather than continuing. Per-request
+network/provider timeouts and the provider circuit breaker are unaffected either way.
 
 ## Cost
 
