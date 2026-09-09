@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.constants import (
     _QUERY_INTENT_ALIASES,
@@ -643,6 +643,52 @@ _CRITERION_TYPE_ALIASES = {
     "concept": "professional_concept", "leadership": "professional_concept",
     "mentorship": "professional_concept", "capability": "professional_concept",
 }
+
+
+class LenientSearchCriterion(BaseModel):
+    """TRANSPORT-ONLY. The shapes a model legitimately emits for one criterion —
+    ``operator: null`` / ``value: null`` (it used ``concept`` / ``values``
+    instead), a missing ``id``, ``values`` as a bare string, ``weight`` absent or
+    a string, ``modality`` / ``scope`` null. ``query_transport.repair_plan``
+    normalizes this into a plain dict the STRICT ``SearchCriterion`` accepts, so
+    one harmless nullable field never triggers three identical LLM retries then a
+    silent deterministic fallback. The strict schema below is unchanged."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = None
+    type: str | None = None
+    weight: float | int | str | None = None
+    required: bool | None = None
+    value: str | int | float | bool | list | dict | None = None
+    values: list | str | None = None
+    operator: str | None = None
+    scope: str | None = None
+    concept: str | None = None
+    modality: str | None = None
+
+
+class LenientSearchPlan(BaseModel):
+    """TRANSPORT-ONLY — the permissive parse target for the query-interpretation
+    LLM call. Every field optional; ``query_transport.repair_plan`` turns it into
+    a dict that is then validated against the strict ``ParsedSearchQuery``."""
+
+    model_config = ConfigDict(extra="allow")
+
+    intent: object | None = None
+    criteria: list[LenientSearchCriterion] = []
+    context: object | None = None
+    target_person_context: object | None = None
+    unresolved: object | None = None
+    interpretation_summary: object | None = None
+    interpretation_confidence: object | None = None
+
+    @field_validator("criteria", mode="before")
+    @classmethod
+    def _only_objects(cls, v):
+        if not isinstance(v, list):
+            return [v] if isinstance(v, dict) else []
+        return [c for c in v if isinstance(c, (dict, LenientSearchCriterion))]
 
 
 class SearchCriterion(BaseModel):

@@ -100,6 +100,49 @@ _REGION_IN_RE = re.compile(
     re.I,
 )
 
+#: case-INSENSITIVE variants, used only when the query carries no casing signal
+#: (all-lower / all-upper). Precision then comes from ``_NOT_A_PLACE`` + shape,
+#: never a city allowlist.
+_LOC_ONE_CI_RE = re.compile(
+    r"\b(?:in|from|near|around|based in|located in)\s+"
+    r"(?:the\s+)?([a-z][\w.\-]+(?:\s+[a-z][\w.\-]+){0,3})",
+    re.I,
+)
+_LOC_OR_CI_RE = re.compile(_LOC_OR_RE.pattern, re.I)
+
+#: common objects of "in <X>" that are professions / domains / states-of-being,
+#: NOT geographic places. Generic (not query-specific, not a city list) — it lets
+#: "in atlanta" resolve to a location while "in leadership" / "in sales" do not.
+_NOT_A_PLACE = frozenset({
+    "leadership", "management", "sales", "marketing", "research", "operations",
+    "finance", "accounting", "design", "product", "engineering", "security",
+    "compliance", "recruiting", "hr", "legal", "support", "strategy", "consulting",
+    "academia", "industry", "government", "policy", "healthcare", "biotech",
+    "fintech", "tech", "big tech", "faang", "startup", "startups", "enterprise",
+    "software", "hardware", "data", "analytics", "devops", "infrastructure",
+    "the industry", "the field", "the space", "the sector", "my field", "my network",
+})
+
+
+def _casing_uninformative(query: str) -> bool:
+    """True when the query's capitalization carries no signal — it is entirely
+    lower-case or entirely upper-case (ignoring the first character). In that
+    state a lower-case place name is as strong a location cue as a Title-cased
+    one would be, so the case-insensitive location pass may run."""
+    body = query[1:] if query else ""
+    return body == body.lower() or query == query.upper()
+
+
+def _plausible_ci_place(cand: str) -> bool:
+    c = cand.strip().lower()
+    if c in _NOT_A_PLACE or c in _NOT_A_COMPANY:
+        return False
+    if any(tok in _NOT_A_PLACE for tok in c.split()):
+        return False
+    # a place is a short proper-noun phrase; reject long descriptive spans
+    return 1 <= len(c.split()) <= 4 and len(c) >= 3
+
+
 _FORMER_RE = re.compile(
     r"(?i:\b(?:former|formerly|previously|ex[- ]|used to work (?:at|for))\s*"
     r"(?:employees?\s+of\s+|people\s+(?:at|from)\s+|worked\s+(?:at|for)\s+)?)"
@@ -183,6 +226,20 @@ def extract_facts(query: str, *, context: dict[str, str] | None = None) -> FactS
                 cand = one.group(1).strip()
                 if _looks_like_place(cand):
                     places = [cand]
+                    break
+    # capitalization invariance (§9): "... in atlanta" / "... IN ATLANTA" must
+    # behave like "... in Atlanta". Only when the query itself uses no casing.
+    if not places and _casing_uninformative(q):
+        ci_or = _LOC_OR_CI_RE.search(q)
+        if ci_or:
+            cand_list = [p for p in _split_or(ci_or.group(1)) if _plausible_ci_place(p)]
+            if len(cand_list) == len(_split_or(ci_or.group(1))) and cand_list:
+                places = [p.title() for p in cand_list]
+        if not places:
+            for one in _LOC_ONE_CI_RE.finditer(q):
+                cand = one.group(1).strip()
+                if _plausible_ci_place(cand):
+                    places = [cand.title()]
                     break
     if places:
         fs.criteria.append(SearchCriterion(
