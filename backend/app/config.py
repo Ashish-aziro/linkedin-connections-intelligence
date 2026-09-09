@@ -39,14 +39,7 @@ class Settings(BaseSettings):
     # ANTHROPIC_API_KEY is non-empty, Anthropic is tried first, ahead of Groq.
     anthropic_api_key: str = ""
     anthropic_workspace_id: str = ""  # only needed for identity-linked keys
-    #: V4 PART 6 B1 — Sonnet 5 is the production default. The PART 6 benchmark
-    #: found it 7/7 first-call-valid on query interpretation (Haiku 4.5: 5/7,
-    #: with a recurring ``value=null`` schema failure) and 0 hallucinated
-    #: evidence refs in the semantic judge (Haiku 4.5: 21 across the suite).
-    #: Configurable via ``ANTHROPIC_MODEL``. Claude 5 models need the Claude 5
-    #: request shape (no assistant prefill, no ``temperature``) — see
-    #: ``llm/anthropic_client.py``.
-    anthropic_model: str = "claude-sonnet-5"
+    anthropic_model: str = "claude-haiku-4-5-20251001"
     #: DEPRECATED (V4 §1/§3) — kept so old .env files don't error. It no longer
     #: gates Anthropic: key present == use it.
     enable_paid_llm: bool = False
@@ -61,10 +54,6 @@ class Settings(BaseSettings):
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dim: int = 384
     embeddings_enabled: bool = True  # False -> deterministic hash vectors (tests / no-torch)
-    #: V4 PART 6 B5 — load MiniLM + the cross-encoder in a background thread at
-    #: startup so the first search never pays the ~13s cold-start inside the
-    #: request. Off in tests (they must never download real model weights).
-    warm_models_on_startup: bool = True
 
     # ── Database ─────────────────────────────────────────────
     database_url: str = "sqlite:///./data/app.db"
@@ -93,23 +82,6 @@ class Settings(BaseSettings):
     top_connections: int = 20
     min_match_score: float = 12.0          # drop incidental / weak matches (spec §38)
     llm_query_interpretation: bool = True  # False -> deterministic query parser only
-    #: V4 PART 6 B2 — the HARD product rule. When True (default), a search returns
-    #: NO user-visible candidates unless an LLM successfully participated:
-    #:   * interpretation fell back to the regex parser  -> AI_UNAVAILABLE, results=[]
-    #:   * a required semantic judge produced 0 valid verdicts -> VERIFICATION_INCOMPLETE
-    #: Deterministic scoring/validation still runs internally — it just never
-    #: becomes the shown answer. Set False only to restore the old behaviour.
-    require_llm_for_results: bool = True
-    #: V4 PART 6 B13 — when True, ONLY Anthropic may verify a search. Any
-    #: Anthropic failure -> AI_UNAVAILABLE (no Groq/OpenRouter fallback for the
-    #: final result). When False, the fallback chain may verify, but SOME
-    #: successful LLM verification is still mandatory (``require_llm_for_results``).
-    search_require_anthropic: bool = False
-    #: V4 PART 6 B10 — when True (default after B6–B9), a search shows results
-    #: only if the final audit completed. The PART 6 judge compaction brought
-    #: audit completion to ~100% on a normal search, so an incomplete audit now
-    #: genuinely means "verification failed" -> VERIFICATION_INCOMPLETE, results=[].
-    search_require_final_audit: bool = True
     #: hardening PART 17 — query interpretation is foundational (never metered
     #: by SEARCH_LLM_MAX_CALLS) so it must not be allowed to hold a search
     #: hostage on a slow-but-not-failing provider; a bounded timeout falls
@@ -122,15 +94,10 @@ class Settings(BaseSettings):
     #: hit, remaining optional work is skipped, deterministic results stand, and
     #: unresolved conditions stay UNKNOWN with judge/audit status PARTIAL.
     search_llm_max_calls: int = 0
-    #: V4 PART 6 B9 — ONE end-to-end request budget. Every expensive stage checks
-    #: ``deadline.remaining()`` and will not start work that cannot finish. If it
-    #: expires BEFORE required AI verification completes the search returns
-    #: VERIFICATION_INCOMPLETE with results=[] (never deterministic fallback).
-    #: Measured: a fully-verified Sonnet-5 search (interp + exhaustive judge +
-    #: grounded audit) on the ~1k dataset runs ~60–120 s, so this is a generous
-    #: runaway-protection ceiling, NOT a tight interactive SLA — see the PART 6
-    #: report for the honest latency numbers. <= 0 disables it (tests).
-    search_max_seconds: float = 200.0
+    #: hardening PART 14 — wall-clock budget for a search's OPTIONAL LLM work
+    #: (judge + audit + reason generation). Deterministic scoring is never
+    #: skipped for time. <= 0 disables the deadline (unlimited).
+    search_max_seconds: float = 45.0
 
     # ── Search quality v2 ────────────────────────────────────
     relevance_weight: float = 20.0         # points reserved for whole-profile relevance

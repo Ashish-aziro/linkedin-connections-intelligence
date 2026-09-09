@@ -252,16 +252,11 @@ def _out(decision, conf, raw, reviews, top_sup, top_con, *, applied, failed, not
     unsupported_reasons = [
         r["reason"] for r in reviews if r["status_review"] == "unsupported" and r["reason"]
     ]
-    #: B11 — a grounded one-liner from the auditor, kept ONLY for an approved
-    #: candidate (its evidence was validated). Display-only; never scored.
-    display_reason = (raw.get("display_reason") or "").strip()[:300] \
-        if decision == AuditDecision.APPROVED and applied != Qualification.NOT_MATCH else ""
     return {
         "person_id": raw.get("person_id"),
         "decision": decision,
         "confidence": round(float(conf), 3),
         "reason": (raw.get("reason") or "")[:400],
-        "display_reason": display_reason,
         "criteria": [{k: v for k, v in r.items() if k != "dropped_refs"} for r in reviews],
         "missing_required_reviews": missing_required_reviews,
         "supporting_evidence_refs": top_sup,

@@ -115,30 +115,22 @@ def test_audit_never_exceeds_the_absolute_ceiling():
 # ─────────────────────── proactive batch sizing ───────────────────────
 
 
-def test_plan_batch_size_stays_near_the_configured_size_for_single_criterion_queries():
-    # V4 PART 6 B8 — a 1-judgeable-criterion query (e.g. "nonprofit experience
-    # in Chicago") keeps a near-full batch (~7/10) — a few fast, non-truncating
-    # calls, never ~1/candidate.
-    assert plan_batch_size(10, 1.0) >= 6
+def test_plan_batch_size_unchanged_for_simple_low_criteria_queries():
+    assert plan_batch_size(10, 1.0) == 10
+    assert plan_batch_size(10, 1.5) == 10
 
 
-def test_plan_batch_size_shrinks_for_dense_multi_criteria_queries():
-    # Sonnet 5 latency is super-linear in output size — smaller batches for a
-    # dense query are faster overall AND do not truncate.
-    from app.services.llm.token_estimate import _BATCH_OUTPUT_CEILING, estimate_judge_output_tokens
-
-    moderate = plan_batch_size(10, 3.0)
-    dense = plan_batch_size(10, 6.0)
-    very_dense = plan_batch_size(10, 12.0)
-    assert 10 > moderate > dense >= very_dense >= 1
-    # a multi-candidate batch's estimate stays near the ceiling; a single very
-    # dense candidate (batch already at min_size 1) can legitimately need more.
-    assert estimate_judge_output_tokens(moderate, [3] * moderate) <= int(_BATCH_OUTPUT_CEILING * 1.5)
-    assert estimate_judge_output_tokens(very_dense, [12] * very_dense) <= MAX_OUTPUT_TOKENS
+def test_plan_batch_size_shrinks_as_criteria_density_rises():
+    simple = plan_batch_size(10, 1.0)
+    moderate = plan_batch_size(10, 2.5)
+    dense = plan_batch_size(10, 5.0)
+    very_dense = plan_batch_size(10, 8.0)
+    assert simple > moderate > dense > very_dense
+    assert very_dense >= 1  # never below min_size
 
 
 def test_plan_batch_size_never_exceeds_the_default_size():
-    assert plan_batch_size(3, 20.0) <= 3
+    assert plan_batch_size(3, 8.0) <= 3
 
 
 # ─────────────────────── serialized compact-verdict size sanity ───────────────────────

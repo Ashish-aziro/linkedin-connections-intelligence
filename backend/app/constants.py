@@ -117,36 +117,6 @@ SEMANTIC_CRITERION_TYPES = {
 }
 
 
-class SearchStatus:
-    """End-to-end outcome of a search (V4 PART 6 B2 / B12 / B22).
-
-    A search only returns user-visible candidates when an LLM successfully
-    participated. Deterministic code still filters / scores / validates
-    internally, but it never becomes the final semantic answer.
-    """
-
-    SUCCESS = "success"                              # LLM-verified via Anthropic
-    SUCCESS_WITH_FALLBACK = "success_with_fallback"  # LLM-verified via a fallback provider
-    #: a required LLM stage (semantic judge / final audit) did not complete —
-    #: results = [] rather than showing unverified deterministic candidates.
-    VERIFICATION_INCOMPLETE = "verification_incomplete"
-    #: query interpretation produced no LLM plan (fell to the regex parser), or
-    #: SEARCH_REQUIRE_ANTHROPIC is set and Anthropic failed — results = [].
-    AI_UNAVAILABLE = "ai_unavailable"
-
-
-#: statuses that are allowed to carry user-visible candidate results
-RESULT_BEARING_STATUSES = {SearchStatus.SUCCESS, SearchStatus.SUCCESS_WITH_FALLBACK}
-
-
-class VerificationStatus:
-    """Whether the LLM verification a query *needed* actually happened."""
-
-    COMPLETE = "complete"            # every required LLM stage produced validated output
-    INCOMPLETE = "incomplete"        # a required LLM stage failed / was cut off
-    NOT_REQUIRED = "not_required"    # the query had no criteria needing LLM judgement
-
-
 class Qualification:
     """Candidate-level match tier (V4 §22–§25). Ranked before match_score."""
 

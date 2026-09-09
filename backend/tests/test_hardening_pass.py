@@ -515,9 +515,6 @@ def test_offline_1000_profile_benchmark_does_not_explode_judge_calls(monkeypatch
     assert run.metadata.candidates_decided_locally == VIABLE - AMBIGUOUS
     assert run.metadata.candidates_needing_llm == AMBIGUOUS
     # the actual assertion the mission cares about: NOT ~100 judge requests for
-    # a ~1,000-person network just because the network is large. Batch size is
-    # criteria-density-driven (V4 PART 6 B8) — ~7 for a 1-criterion query — so
-    # 47 ambiguous candidates -> a handful of batches, never ~1/candidate.
-    assert judge_requests["n"] <= 10
-    assert judge_requests["n"] * 10 < AMBIGUOUS * 3  # far from 1/candidate
+    # a ~1,000-person network just because the network is large.
+    assert judge_requests["n"] <= 5
     assert judge_requests["n"] == run.metadata.judge_batch_count

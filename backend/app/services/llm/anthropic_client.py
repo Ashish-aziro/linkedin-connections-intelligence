@@ -1,21 +1,8 @@
 """Anthropic Messages API client (paid — opt-in only).
 
-Not OpenAI-compatible: different endpoint, headers, and body shape.
-
-**Claude 5 compatibility (V4 PART 6 B0).** Current-generation Claude models
-(Sonnet 5 / Opus 5 / the Fable line, and Claude 4.7+) reject two things the
-earlier client relied on, both with HTTP 400:
-
-  * ``temperature``            — "`temperature` is deprecated for this model"
-  * an assistant-turn prefill  — "This model does not support assistant message
-    prefill. The conversation must end with a user message."
-
-So this client sends **neither**. It is a capability choice, not a per-model
-branch — older models accept a request with no ``temperature`` and no prefill
-too, and JSON is coaxed by the system instruction + ``_extract_json`` (which
-already tolerates ``` fences and a leading prose sentence). Only ``text``
-content blocks are read; a ``thinking`` block, if the model emits one, is
-ignored.
+Not OpenAI-compatible: different endpoint, headers, and body shape. JSON output
+is coaxed by prefilling the assistant turn with ``{`` so the reply always starts
+as a JSON object; the leading brace is stitched back on before parsing.
 """
 from __future__ import annotations
 
@@ -41,19 +28,6 @@ _URL = "https://api.anthropic.com/v1/messages"
 _VERSION = "2023-06-01"
 
 
-def _text_blocks(content) -> str:
-    """Concatenate every ``text`` block; skip ``thinking`` / ``redacted_thinking``
-    / tool blocks. Raises ``LLMBadOutput`` on an unexpected shape."""
-    try:
-        return "".join(
-            block.get("text", "")
-            for block in (content or [])
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-    except (AttributeError, TypeError) as e:  # pragma: no cover - defensive
-        raise LLMBadOutput(f"unexpected Anthropic response shape: {e}") from e
-
-
 def messages_json(
     *,
     api_key: str,
@@ -67,11 +41,12 @@ def messages_json(
     payload = {
         "model": model,
         "max_tokens": max_tokens,
-        # NO "temperature" — deprecated on Claude 5, and unnecessary here.
+        "temperature": 0.2,
         "system": system_prompt + "\n\nRespond with a single JSON object and nothing else.",
-        # NO assistant prefill — Claude 5 requires the conversation to end with
-        # a user message.
-        "messages": [{"role": "user", "content": user_prompt}],
+        "messages": [
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": "{"},
+        ],
     }
     headers = {
         "x-api-key": api_key,
@@ -102,25 +77,29 @@ def messages_json(
         # identity-linked key without / with a wrong ANTHROPIC_WORKSPACE_ID (V4 §7)
         raise LLMConfigError("anthropic workspace configuration error")
     if resp.status_code in (400, 404):
-        # unknown model, malformed request, billing/credit problem — identical on
-        # retry, so the router moves to the next provider and cools this one down.
-        raise LLMConfigError(f"anthropic request rejected ({resp.status_code}): {resp.text[:200]}")
+        # unknown model, malformed request — identical on retry
+        raise LLMConfigError(f"anthropic request rejected ({resp.status_code})")
     if resp.status_code >= 400:
         raise LLMConfigError(f"anthropic error {resp.status_code}")
 
     body = resp.json()
     stop_reason = body.get("stop_reason")
-    text = _text_blocks(body.get("content", []))
+    try:
+        text = "".join(
+            block.get("text", "") for block in body.get("content", []) if block.get("type") == "text"
+        )
+    except (AttributeError, TypeError) as e:
+        raise LLMBadOutput(f"unexpected Anthropic response shape: {e}") from e
 
     if not text.strip():
         if stop_reason == "max_tokens":
-            raise LLMOutputTruncated(
-                f"Anthropic returned no text and stopped at max_tokens={max_tokens}"
-            )
+            raise LLMOutputTruncated(f"Anthropic returned no text and stopped at max_tokens={max_tokens}")
         raise LLMBadOutput("empty Anthropic response")
 
+    # the assistant turn was prefilled with "{", so stitch it back on
+    full = "{" + text if not text.lstrip().startswith("{") else text
     try:
-        return _extract_json(text)
+        return _extract_json(full)
     except LLMBadOutput as e:
         # a genuinely malformed response stays LLMBadOutput (retry-same-provider
         # can still help); one that hit the token ceiling gets its own category
@@ -128,6 +107,6 @@ def messages_json(
         if stop_reason == "max_tokens":
             raise LLMOutputTruncated(
                 f"Anthropic hit max_tokens={max_tokens} before completing valid JSON "
-                f"({len(text)} chars produced): {e}"
+                f"({len(full)} chars produced): {e}"
             ) from e
         raise

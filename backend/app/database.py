@@ -57,39 +57,8 @@ def get_db() -> Iterator[Session]:
         db.close()
 
 
-#: SQLite columns added after their table first shipped. ``create_all`` adds
-#: missing TABLES but never a new COLUMN — this bridges that one gap for a DB
-#: file that predates the column (this project has no migration framework).
-_LATE_COLUMNS = {
-    "search_run_states": {"search_status": "VARCHAR", "verification_metadata": "JSON"},
-}
-
-
-def ensure_schema(eng=None) -> None:
-    """Create missing tables + add late columns. Idempotent. ``eng`` defaults to
-    the app engine; the eval harness passes its own engine for pilot.db / a
-    copy of app.db so those get the PART 6 columns too."""
+def init_db() -> None:
+    """Create all tables. Safe to call repeatedly."""
     from app import models  # noqa: F401  — registers mappers
 
-    eng = eng or engine
-    Base.metadata.create_all(bind=eng)
-    if not str(eng.url).startswith("sqlite"):
-        return
-    from sqlalchemy import inspect, text
-
-    insp = inspect(eng)
-    tables = set(insp.get_table_names())
-    for table, cols in _LATE_COLUMNS.items():
-        if table not in tables:
-            continue
-        have = {c["name"] for c in insp.get_columns(table)}
-        missing = {k: v for k, v in cols.items() if k not in have}
-        if missing:
-            with eng.begin() as conn:
-                for name, sqltype in missing.items():
-                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {sqltype}"))
-
-
-def init_db() -> None:
-    """Create all tables + apply late columns. Safe to call repeatedly."""
-    ensure_schema(engine)
+    Base.metadata.create_all(bind=engine)

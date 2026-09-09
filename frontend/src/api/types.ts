@@ -193,24 +193,6 @@ export interface SearchResponse {
   };
   llm_provider: string | null;
   llm_model: string | null;
-
-  // ── V4 PART 6 B2/B9/B12/B30 — AI verification state ──────────────────────
-  // "success" | "success_with_fallback" carry results; "verification_incomplete"
-  // | "ai_unavailable" never do (results/near_matches are []).
-  search_status?:
-    | "success"
-    | "success_with_fallback"
-    | "verification_incomplete"
-    | "ai_unavailable";
-  verification_status?: "complete" | "incomplete" | "not_required";
-  ai_provider?: string | null;
-  ai_model?: string | null;
-  anthropic_attempted?: boolean;
-  anthropic_succeeded?: boolean;
-  fallback_used?: boolean;
-  llm_verified?: boolean;
-  unverified_results_suppressed?: number;
-
   // V4 PART 3 §32 — observability for the exhaustive semantic-judge run.
   // Absent on searches that did not run the judge; frontend rendering comes later.
   judge_metadata?: {

@@ -33,19 +33,6 @@ def _get_model():
     return _model
 
 
-def model_ready() -> bool:
-    """True once the CrossEncoder is loaded and process-cached (B5)."""
-    return _model is not None
-
-
-def warm() -> None:
-    """Preload + cache the cross-encoder now (idempotent). No-op when the
-    reranker is disabled."""
-    if not settings.reranker_enabled:
-        return
-    _get_model()
-
-
 def cross_encode(query: str, texts: list[str]) -> list[float]:
     """Relevance score in [0,1] per text (min-max normalised across this batch)."""
     if not texts:

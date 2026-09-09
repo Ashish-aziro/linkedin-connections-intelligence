@@ -46,19 +46,6 @@ def _get_model():
     return _model
 
 
-def model_ready() -> bool:
-    """True once the SentenceTransformer is loaded and process-cached (B5)."""
-    return _model is not None
-
-
-def warm() -> None:
-    """Preload + cache the embedding model now (idempotent). No-op when
-    embeddings are disabled (tests / no-torch use hash vectors)."""
-    if not settings.embeddings_enabled:
-        return
-    _get_model()
-
-
 def embed_text(text: str) -> bytes:
     from app.services import search_profile
 

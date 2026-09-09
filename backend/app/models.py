@@ -432,13 +432,4 @@ class SearchRunState(Base):
     judge_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     audit_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
-    #: V4 PART 6 B2 — end-to-end search outcome (``SearchStatus``). A failed /
-    #: incomplete search persists this + an empty result set so a reload never
-    #: resurrects unverified deterministic candidates.
-    search_status: Mapped[str | None] = mapped_column(String, nullable=True)
-    #: V4 PART 6 B9/B30 — {ai_provider, ai_model, anthropic_attempted,
-    #: anthropic_succeeded, fallback_used, llm_verified, verification_status,
-    #: results_suppressed, reason}. No secrets.
-    verification_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

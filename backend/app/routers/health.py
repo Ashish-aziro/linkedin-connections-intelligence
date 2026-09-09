@@ -15,20 +15,12 @@ def health() -> dict:
         "use_fixtures": settings.use_fixtures,
         "apify_configured": bool(settings.apify_api_token),
         "embedding_model": settings.embedding_model,
-        "models": _model_readiness(),
         "llm": _llm_health(),
         # legacy flat keys — kept for any existing dashboards
         "groq_configured": bool(settings.groq_api_key),
         "openrouter_configured": bool(settings.openrouter_api_key),
         "anthropic_active": bool(settings.anthropic_api_key),
     }
-
-
-def _model_readiness() -> dict:
-    """B5 — are the local ML models preloaded (warm) yet? No loads triggered."""
-    from app.services.model_warmup import ready
-
-    return {**ready(), "warm_on_startup": settings.warm_models_on_startup}
 
 
 def _llm_health() -> dict:

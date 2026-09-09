@@ -348,7 +348,7 @@ def test_promotion_uses_only_the_already_audited_buffer(monkeypatch):
                                    {"volunteering": [], "recommendations": []}) for sc in pool}
 
     run = final_auditor.run_final_audit("q", plan, pool, ScoringContext(), bundle_by_id=bundle_by_id)
-    assert sum(len(c["packets"]) for c in calls) == 5  # all 5 audited (batched, B8)
+    assert len(calls) == 1
     assert run.metadata.requested_candidates == 5
 
     survivors = []
@@ -376,11 +376,9 @@ def test_partial_audit_failure_does_not_crash(monkeypatch):
     run = final_auditor.run_final_audit("q", plan, pool, ScoringContext(), bundle_by_id=bundle_by_id)
 
     assert run.metadata.status == AuditStatus.PARTIAL
-    # first batch succeeds, the rest fail � batch size is criteria-density-driven (B8)
-    assert run.metadata.successful_batches == 1
-    assert run.metadata.failed_batches == run.metadata.batch_count - 1
+    assert run.metadata.successful_batches == 1 and run.metadata.failed_batches == 2
     unaudited = [pid for pid, d in run.decisions.items() if d.get("audit_missing")]
-    assert 0 < len(unaudited) < 30 and len(run.decisions) == 30
+    assert len(unaudited) == 20
     assert all(run.decisions[pid]["decision"] == AuditDecision.UNKNOWN for pid in unaudited)
 
 
@@ -413,7 +411,7 @@ def test_deadline_reached_stops_further_audit_batches(monkeypatch):
     assert run.metadata.status == AuditStatus.PARTIAL
     assert run.metadata.successful_batches == 1
     unaudited = [pid for pid, d in run.decisions.items() if d.get("audit_missing")]
-    assert 0 < len(unaudited) < 30 and len(run.decisions) == 30
+    assert len(unaudited) == 20
     assert all(run.decisions[pid]["decision"] == AuditDecision.UNKNOWN for pid in unaudited)
 
 
