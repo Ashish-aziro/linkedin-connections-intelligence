@@ -15,13 +15,9 @@ evidence-backed 0-100 match score, a grounded reason, exact supporting evidence,
 | **Python (this backend)** | Owns factual truth, chronology, qualification, and the numeric score. Every LLM judgment is validated against real evidence before it can change a result — an invalid or hallucinated reference is rejected, not trusted. |
 
 Anthropic is the primary provider once `ANTHROPIC_API_KEY` is set (see **Setup**
-below) — it is a **paid** API. Optional free fallbacks (Groq, OpenRouter) can stand in
-for any LLM step. Enrichment still completes with no LLM key at all (profiles are
-scraped, normalized, embedded and marked READY; only the semantic pass is skipped and
-backfilled later). **Search is different:** with `REQUIRE_LLM_FOR_RESULTS=true` (the
-default) a query returns **no user-visible results** unless an LLM successfully
-interpreted and — where the query needs it — verified the matches. Deterministic
-scoring still runs internally, but keyword-only matches are never shown as results.
+below) — it is a **paid** API. Optional free fallbacks (Groq, OpenRouter) and a fully
+deterministic fallback exist for every LLM step, so the app still works with no LLM key
+at all, just with less semantic nuance.
 
 ## Stack
 
@@ -30,7 +26,7 @@ scoring still runs internally, but keyword-only matches are never shown as resul
 | Backend | Python 3.11 · FastAPI · Pydantic v2 · SQLAlchemy 2 · SQLite (Postgres-ready via `DATABASE_URL`) |
 | Frontend | Vite · React · TypeScript · Tailwind · TanStack Query |
 | Profile data | Apify actor `harvestapi/linkedin-profile-scraper` (`LpVuK3Zozwuipa5bp`), *Profile details no email* — never enables email search, never switches to a costlier mode |
-| LLM | Anthropic (primary, paid) -> Groq -> OpenRouter (`:free`), per step. Enrichment falls back to deterministic-only; search does not — no successful LLM step means no user-visible search results. |
+| LLM | Anthropic (primary, paid) -> Groq -> OpenRouter (`:free`) -> deterministic fallback, per step |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2`, local, numpy brute-force cosine — no key, no cost |
 
 ## Setup
@@ -106,8 +102,7 @@ CSV -> parse (skip export preamble) -> canonicalize URLs -> dedupe by public id
 
 ```
 query
-  -> Anthropic query interpretation (if it falls back to the deterministic parser
-     the search stops here: search_status=ai_unavailable, results=[])
+  -> Anthropic query interpretation (or deterministic parser)
   -> full local scan of every connection (<= FULL_SCAN_MAX_CONNECTIONS)
   -> hard-fact viability gate (verified contradictions only)
   -> local pre-score: stored facts + cached company classification + stored
@@ -128,28 +123,16 @@ query
 
 Search **never** calls Apify. A saved search reload **never** re-runs any LLM,
 embedding, judge, or audit step — it replays the exact response that was first
-returned (a failed/incomplete search reloads with `results=[]` too).
-
-If required AI verification cannot be completed — interpretation fell back to the
-regex parser, a required semantic judge produced no valid verdicts, or a required
-final audit did not finish — the search returns `search_status=ai_unavailable` or
-`verification_incomplete` with `results=[]` and `near_matches=[]`. **No required AI
-verification ⇒ no user-visible search results** — deterministic matches are never
-shown as verified ones. (`SEARCH_LLM_MAX_CALLS` / `SEARCH_MAX_SECONDS` are a softer
-control: once the query's required verification has succeeded, hitting the cap only
-skips remaining *optional* work and the response is marked partial.)
+returned.
 
 Because most candidates are already decided from stored facts and semantics, a
 ~1,000-connection network does **not** turn a broad query into ~100 Anthropic calls —
 only the genuinely ambiguous candidates reach the judge. An optional
-`SEARCH_LLM_MAX_CALLS` soft budget can cap query-time LLM spend further; once the
-query's required verification has succeeded, hitting the cap only skips remaining
-optional work and the UI marks verification as partial — it never silently pretends a
-review was complete, and it never resurrects unverified results if required
-verification had NOT succeeded. `SEARCH_MAX_SECONDS` is the same idea for wall time:
-new judge/audit batches stop starting once the deadline passes; if that happens before
-required verification finished, the search returns `verification_incomplete` with no
-results rather than hanging.
+`SEARCH_LLM_MAX_CALLS` soft budget can cap query-time LLM spend further; if it's hit,
+deterministic results still stand and the UI marks verification as partial — it never
+silently pretends a review was complete. `SEARCH_MAX_SECONDS` is the same idea for wall
+time: a very broad or difficult query stops starting new judge/audit batches once the
+deadline passes and returns partial-but-useful results instead of hanging.
 
 ## Cost
 
