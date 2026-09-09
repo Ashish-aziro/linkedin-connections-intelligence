@@ -316,7 +316,4 @@ class CompanyClassProvenance:
 
 class LLMProviderName:
     ANTHROPIC = "anthropic:paid"
-    GROQ_PRIMARY = "groq:primary"
-    GROQ_FALLBACK = "groq:fallback"
-    OPENROUTER = "openrouter:free"
     NONE = "none"

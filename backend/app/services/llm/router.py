@@ -1,11 +1,12 @@
-"""LLM fallback chain (spec §24–§25, V4 §2–§11).
+"""LLM call with structured-output validation, retries and a circuit breaker.
 
-Provider order comes from ``default_chain()`` — Anthropic first whenever a key
-is configured, then Groq primary, Groq fallback, OpenRouter free. The first
-provider that returns validated structured output wins and the chain stops
-(V4 §4). Any failure falls through to the next provider (V4 §5), and errors are
-classified so unretryable failures (bad key, bad workspace, unknown model) move
-on immediately and cool that provider down (V4 §6/§8).
+Providers come from ``default_chain()`` — Anthropic only (a list with one
+``AnthropicProvider`` when a key is configured, else empty). The first provider
+that returns validated structured output wins; any failure falls through to the
+next provider if there is one, and errors are classified so unretryable failures
+(bad key, bad workspace, unknown model) move on immediately and cool that
+provider down. When the chain is empty or exhausted the call returns ``None``
+and the caller uses its deterministic path.
 """
 from __future__ import annotations
 
@@ -107,11 +108,11 @@ def generate_structured(
                     continue
             except (LLMOutputTruncated, LLMRequestTooLarge) as e:
                 # the problem is the request/expected-response SIZE, not this
-                # provider — trying Groq/OpenRouter with the IDENTICAL oversized
-                # payload would just fail the same way (413 / another truncation)
-                # and waste a round trip. Return to the caller IMMEDIATELY so the
-                # adaptive splitter can shrink the request; the smaller request
-                # then goes through the full provider chain from the top.
+                # provider — re-sending the IDENTICAL oversized payload to any
+                # next provider would just fail the same way (413 / another
+                # truncation) and waste a round trip. Return to the caller
+                # IMMEDIATELY so the adaptive splitter can shrink the request;
+                # the smaller request then goes through the chain from the top.
                 attempts.append({"provider": provider.name, "status": e.category})
                 log.warning("%s -> %s %s: %s (returning to caller — no same-size fallback)",
                            operation, provider.name, e.category, str(e)[:160])

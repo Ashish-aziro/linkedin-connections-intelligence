@@ -27,26 +27,18 @@ class Settings(BaseSettings):
     apify_actor_id: str = "LpVuK3Zozwuipa5bp"
     apify_profile_scraper_mode: str = "Profile details no email ($4 per 1k)"
 
-    # ── LLM providers ────────────────────────────────────────
-    groq_api_key: str = ""
-    openrouter_api_key: str = ""
-    groq_primary_model: str = "openai/gpt-oss-120b"
-    groq_fallback_model: str = "openai/gpt-oss-20b"
-    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
-    llm_max_retries: int = 2
-
-    # Anthropic (V4 §1) — a CONFIGURED api key is itself the opt-in. When
-    # ANTHROPIC_API_KEY is non-empty, Anthropic is tried first, ahead of Groq.
+    # ── LLM (Anthropic is the only external provider) ────────
+    #: A CONFIGURED api key is itself the opt-in. With no key the app still runs
+    #: — LLM calls return None and the deterministic parser / scoring stands in.
     anthropic_api_key: str = ""
     anthropic_workspace_id: str = ""  # only needed for identity-linked keys
     anthropic_model: str = "claude-haiku-4-5-20251001"
-    #: DEPRECATED (V4 §1/§3) — kept so old .env files don't error. It no longer
-    #: gates Anthropic: key present == use it.
+    llm_max_retries: int = 2
+    #: DEPRECATED — kept so an old .env file doesn't error. Does not gate anything.
     enable_paid_llm: bool = False
-    #: DEPRECATED (V4 §3) — Anthropic is always first when a key is configured.
     anthropic_first: bool = True
 
-    # Provider circuit breaker (V4 §8) — process-local, never persisted.
+    # Provider circuit breaker — process-local, never persisted.
     llm_provider_cooldown_seconds: float = 90.0               # transient (429/5xx/transport)
     anthropic_config_failure_cooldown_seconds: float = 900.0  # auth / bad workspace / bad model
 

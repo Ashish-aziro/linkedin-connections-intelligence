@@ -28,10 +28,6 @@ def provider_routing() -> dict:
         "anthropic_workspace_id_configured": bool(settings.anthropic_workspace_id),
         "anthropic_first": bool(chain) and chain[0].name.startswith("anthropic"),
         "anthropic_model": settings.anthropic_model if settings.anthropic_api_key else None,
-        "groq_configured": bool(settings.groq_api_key),
-        "groq_primary_model": settings.groq_primary_model,
-        "groq_fallback_model": settings.groq_fallback_model,
-        "openrouter_configured": bool(settings.openrouter_api_key),
         "expected_first_provider": chain[0].name if chain else None,
         "anthropic_would_incur_paid_usage": bool(settings.anthropic_api_key),
     }

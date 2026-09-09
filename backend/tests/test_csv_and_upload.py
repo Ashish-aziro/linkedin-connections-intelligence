@@ -81,8 +81,9 @@ def test_health(client):
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "ok"
-    # V4 §12 — llm config block, no secrets, no live calls
+    # llm config block, no secrets, no live calls — Anthropic is the only provider
     llm = body["llm"]
     assert isinstance(llm["priority"], list)
-    assert set(llm) >= {"priority", "anthropic", "groq", "openrouter", "circuit_breakers"}
+    assert set(llm) >= {"priority", "anthropic", "circuit_breakers"}
+    assert "groq" not in llm and "openrouter" not in llm
     assert "api_key" not in str(llm) and "sk-" not in str(llm)

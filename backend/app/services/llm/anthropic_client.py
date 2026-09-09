@@ -6,7 +6,9 @@ as a JSON object; the leading brace is stitched back on before parsing.
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 
 import httpx
 
@@ -20,12 +22,30 @@ from app.services.llm.base import (
     LLMTransport,
     LLMUnavailable,
 )
-from app.services.llm.openai_compatible import _extract_json
 
 log = logging.getLogger("app.llm")
 
 _URL = "https://api.anthropic.com/v1/messages"
 _VERSION = "2023-06-01"
+_JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _extract_json(text: str) -> dict:
+    """Best-effort JSON-object extraction from a model reply (handles a stray
+    ```json fence or leading/trailing prose)."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = _JSON_BLOCK.search(text)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except json.JSONDecodeError as e:
+                raise LLMBadOutput(f"model did not return valid JSON: {e}") from e
+        raise LLMBadOutput("model response contained no JSON object")
 
 
 def messages_json(

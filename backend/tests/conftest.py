@@ -18,8 +18,11 @@ os.environ["LLM_REASON_GENERATION"] = "false"
 # reason generator). Audit tests enable it and mock final_auditor._audit_batch.
 os.environ["FINAL_RESULT_AUDIT_ENABLED"] = "false"
 os.environ["DEVELOPMENT_BATCH_SIZE"] = "3"
-os.environ.setdefault("GROQ_API_KEY", "")
-os.environ.setdefault("APIFY_API_TOKEN", "")
+# no test may make a live external call — hard-clear every provider key so a
+# real backend/.env can never leak a key into the test process (a test that
+# needs one monkeypatches ``settings.<key>`` for its own scope).
+os.environ["ANTHROPIC_API_KEY"] = ""
+os.environ["APIFY_API_TOKEN"] = ""
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

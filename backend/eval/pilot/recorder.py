@@ -231,13 +231,11 @@ def _offline():
 
     saved_chain = _providers.default_chain
     saved_router_chain = _router.default_chain
-    saved_keys = (settings.anthropic_api_key, settings.groq_api_key, settings.openrouter_api_key)
+    saved_key = settings.anthropic_api_key
     saved_audit = settings.final_result_audit_enabled
     _providers.default_chain = _empty_chain
     _router.default_chain = _empty_chain
     settings.anthropic_api_key = ""
-    settings.groq_api_key = ""
-    settings.openrouter_api_key = ""
     settings.final_result_audit_enabled = False
 
     patched: list[tuple] = []
@@ -255,7 +253,7 @@ def _offline():
     finally:
         _providers.default_chain = saved_chain
         _router.default_chain = saved_router_chain
-        (settings.anthropic_api_key, settings.groq_api_key, settings.openrouter_api_key) = saved_keys
+        settings.anthropic_api_key = saved_key
         settings.final_result_audit_enabled = saved_audit
         for mod, fn in patched:
             mod.generate_structured = fn
