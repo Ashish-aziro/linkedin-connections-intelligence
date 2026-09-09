@@ -13,13 +13,11 @@ from app.config import settings
 
 _SECRET_PATTERNS = [
     re.compile(r"(apify_api_[A-Za-z0-9]{6})[A-Za-z0-9]+"),
-    re.compile(r"(gsk_[A-Za-z0-9]{6})[A-Za-z0-9]+"),
-    re.compile(r"(sk-or-[A-Za-z0-9]{6})[A-Za-z0-9\-]+"),
     re.compile(r"(sk-ant-[A-Za-z0-9]{6})[A-Za-z0-9_\-]+"),
 ]
 
 _SECRET_KEYS = {
-    "apify_api_token", "groq_api_key", "openrouter_api_key", "anthropic_api_key",
+    "apify_api_token", "anthropic_api_key",
     "authorization", "x-api-key", "token",
 }
 

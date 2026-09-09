@@ -19,13 +19,11 @@ log = logging.getLogger("app")
 async def lifespan(_app: FastAPI):
     init_db()
     log.info(
-        "startup ok — env=%s use_fixtures=%s apify=%s anthropic=%s groq=%s openrouter=%s",
+        "startup ok — env=%s use_fixtures=%s apify=%s anthropic=%s",
         settings.environment,
         settings.use_fixtures,
         bool(settings.apify_api_token),
         bool(settings.anthropic_api_key),
-        bool(settings.groq_api_key),
-        bool(settings.openrouter_api_key),
     )
     yield
 

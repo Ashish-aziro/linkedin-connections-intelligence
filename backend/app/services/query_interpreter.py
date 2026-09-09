@@ -21,9 +21,11 @@ from __future__ import annotations
 import logging
 import re
 
+from pydantic import ValidationError
+
 from app.config import settings
 from app.constants import CriterionType, Operator, Scope
-from app.schemas import ParsedSearchQuery, SearchCriterion
+from app.schemas import LenientSearchPlan, ParsedSearchQuery, SearchCriterion
 from app.services.llm.router import generate_structured
 from app.services.matching import concept_overlap, seniority_rank
 from app.services.query_facts import (
@@ -32,6 +34,7 @@ from app.services.query_facts import (
     strip_context,
     validate_and_repair,
 )
+from app.services.query_transport import repair_plan
 from app.services.query_intent import augment_plan
 
 log = logging.getLogger("app.query")
@@ -176,6 +179,18 @@ def _soften_requirements(parsed: ParsedSearchQuery, query: str) -> ParsedSearchQ
     return parsed
 
 
+def _strict_from_repaired(repaired: dict) -> ParsedSearchQuery | None:
+    """Validate the structurally-repaired transport plan against the STRICT
+    schema. Returns ``None`` only when the plan is genuinely unusable (no
+    criteria, unrecoverable structure) — that is the one case that legitimately
+    falls through to the deterministic parser."""
+    try:
+        return ParsedSearchQuery.model_validate(repaired)
+    except ValidationError as e:
+        log.info("repaired LLM plan still failed strict validation: %s", str(e)[:200])
+        return None
+
+
 def interpret_query(query: str) -> tuple[ParsedSearchQuery, str, str | None]:
     """Return ``(parsed, provider_name, model)``. provider = 'deterministic' on
     fallback. Every path runs the deterministic fact layer (V4 §15) so explicit
@@ -198,17 +213,23 @@ def interpret_query(query: str) -> tuple[ParsedSearchQuery, str, str | None]:
                 if settings.user_field else ""
             )
             + "Produce the search-plan JSON.",
-            ParsedSearchQuery,
+            # Parse the LLM reply into the TOLERANT transport schema — a harmless
+            # nullable field (operator/value/modality = null, missing id, …) must
+            # not fail validation and trigger three identical retries. The strict
+            # ``ParsedSearchQuery`` still validates the repaired plan below.
+            LenientSearchPlan,
             max_tokens=1200,
             operation="query_interpretation",
             timeout=settings.query_interpretation_timeout_seconds,
         )
         if result is not None:
-            parsed, provider, model = result
-            if parsed.criteria:
+            lenient, provider, model = result
+            repaired, repair_notes = repair_plan(lenient)
+            parsed = _strict_from_repaired(repaired)
+            if parsed is not None and parsed.criteria:
                 parsed = _soften_requirements(parsed, query)
                 parsed, issues = validate_and_repair(parsed, query, facts, context=context)
-                _finalize(parsed, query, issues)
+                _finalize(parsed, query, repair_notes + issues)
                 return parsed, provider, model
         log.info("query interpreter: falling back to deterministic parser")
 

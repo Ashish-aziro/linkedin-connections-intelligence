@@ -71,24 +71,6 @@ def test_anthropic_genuine_malformed_json_stays_bad_output_not_truncated(monkeyp
     assert not isinstance(exc.value, LLMOutputTruncated)  # ended normally -> not truncation
 
 
-def test_openai_compatible_length_finish_reason_is_truncated(monkeypatch):
-    import httpx
-
-    from app.services.llm import openai_compatible
-
-    class _Resp:
-        status_code = 200
-
-        def json(self):
-            return {"choices": [{"finish_reason": "length",
-                                 "message": {"content": '{"reasons": [{"person_id": "p1"'}}]}
-
-    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
-    with pytest.raises(LLMOutputTruncated):
-        openai_compatible.chat_json(base_url="https://x", api_key="k", model="m",
-                                    system_prompt="s", user_prompt="u", max_tokens=50)
-
-
 def test_router_does_not_retry_truncation_identically(monkeypatch):
     from app.services.llm import router as llm_router
     from app.services.llm.base import LLMProvider

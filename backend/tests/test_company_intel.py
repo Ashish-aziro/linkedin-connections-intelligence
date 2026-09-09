@@ -38,7 +38,7 @@ def test_classification_is_cached_not_repeated(db, monkeypatch):
                     )
                 ]
             ),
-            "groq:primary",
+            "anthropic:paid",
             "test-model",
         )
 

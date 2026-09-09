@@ -1,23 +1,28 @@
-# secrets
+# secrets / local config
 .env
 backend/.env
 *.env.local
+*.env.before_*
+backend/.env.before_*
 
 # python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 backend/.venv/
 .venv/
 .pytest_cache/
 *.egg-info/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
-# data / models
+# data / models / local db
 backend/data/
-*.sqlite3
+*.sqlite*
 *.db
+*.db-*
+*.db.backup
 .cache/
 hf_cache/
 
@@ -27,9 +32,12 @@ frontend/dist/
 frontend/.vite/
 frontend/coverage/
 
-# misc
-.DS_Store
-*.log
+# local tooling / editors
+.claude/
 .claude-flow/
 .idea/
 .vscode/
+
+# misc
+.DS_Store
+*.log

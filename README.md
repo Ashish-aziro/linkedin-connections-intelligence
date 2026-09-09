@@ -1,35 +1,158 @@
 # LinkedIn Connections Intelligence
 
-Upload your LinkedIn Connections CSV -> enrich every connection with Apify HarvestAPI
-profile data -> search your network in plain English and get the **Top 20 matching
-people you already know**, each tagged Exact / Possible / Near match with an
-evidence-backed 0-100 match score, a grounded reason, exact supporting evidence, and a
-**separate** data-confidence score.
+A local, single-user tool for searching **your own LinkedIn network** in plain
+English. Upload your LinkedIn *Connections* CSV, enrich each connection with real
+profile data, then ask questions like *"senior engineers in Atlanta"* or *"who
+could help me raise funding for an AI startup"* and get a ranked shortlist of the
+**people you already know**, each with an evidence-backed match score, a grounded
+explanation, and a separate data-confidence score.
 
-## How the three layers divide the work
+## What it does
 
-| Layer | Owns |
+```
+Connections.csv
+  → upload → dataset + Person rows
+  → enrichment: Apify profile scrape → raw JSON (kept verbatim)
+                → deterministic normalization (experiences / education / skills / …)
+                → company classification (once per employer, cached)
+                → semantic profile representation (Anthropic, cached by version)
+                → local MiniLM embedding
+                → READY / PARTIAL
+  → dashboard
+  → natural-language search
+       → Anthropic understands the query → structured search plan
+       → full scan of your connections → hard-fact viability gate
+       → deterministic evidence-based scoring
+       → semantic judge (where a required concept is still unresolved)
+       → fact-consistency validation → rescore → Exact / Possible tiers
+       → cross-encoder reranking within tiers
+       → final grounded audit → grounded explanations
+       → ranked results, persisted
+```
+
+## Key capabilities
+
+- Upload a LinkedIn *Connections* CSV (tolerant parser: skips the export
+  preamble, handles reordered/missing columns, BOM, `;` delimiters)
+- Enrich every connection with Apify HarvestAPI profile data
+- **Resumable** enrichment — leave the page, come back, it picks up where it left off
+- **Semantic backfill** — if the LLM was unavailable during a run, profiles are
+  still scraped/normalized/embedded/marked READY and the semantic pass is
+  retried later with **no Apify re-scrape**
+- General natural-language network search (companies, schools, locations, roles,
+  industries, seniority, AND/OR, exclusions, "might have X", cross-domain, …)
+- **Exact / Possible** match tiers + a 0–100 match score
+- A **separate** data-confidence score (how complete the profile is)
+- Structured evidence per result (which experience / skill / etc. supports it)
+- Grounded, one-line explanations
+- Saved search history — reload a past search with **zero** external calls
+- Excel export (Profiles + Experiences + Education + Skills + Certifications +
+  Languages + Publications)
+- Individual person refresh (respects a TTL unless forced)
+- Dataset deletion (cascades to every derived row)
+
+## Architecture
+
+| Layer | Responsibility |
 |---|---|
-| **Apify** | Gets LinkedIn profile *facts* — employer, title, dates, education, location, skills. Runs ONLY during enrichment, never during search. |
-| **Anthropic** | The primary intelligence layer — understands profile *meaning* (semantic enrichment) and *search intent* (query interpretation, ambiguous-case judging, a final correctness audit, display reasons). Never overrides a verified fact. |
-| **Python (this backend)** | Owns factual truth, chronology, qualification, and the numeric score. Every LLM judgment is validated against real evidence before it can change a result — an invalid or hallucinated reference is rejected, not trusted. |
+| **Apify** | Fetches LinkedIn profile **facts** — employer, title, dates, education, location, skills. Runs **only during enrichment**, never during search. |
+| **Anthropic** | The only external LLM. Understands profile **meaning** (semantic enrichment) and search **intent** (query interpretation, the semantic judge, the final audit, grounded explanations). Never overrides a verified fact and cannot invent profile evidence. |
+| **Python backend** | Owns factual truth, chronology, qualification tiers, and the deterministic numeric score. Every LLM judgment is validated against real stored evidence before it can change a result — an invalid or hallucinated reference is rejected. |
+| **Local ML** | `sentence-transformers/all-MiniLM-L6-v2` embeddings + a `cross-encoder/ms-marco-MiniLM` reranker. No API, no cost. |
+| **Frontend** | Vite + React + TypeScript + Tailwind + TanStack Query. |
 
-Anthropic is the primary provider once `ANTHROPIC_API_KEY` is set (see **Setup**
-below) — it is a **paid** API. Optional free fallbacks (Groq, OpenRouter) and a fully
-deterministic fallback exist for every LLM step, so the app still works with no LLM key
-at all, just with less semantic nuance.
+Anthropic is **the only external LLM provider**. A configured `ANTHROPIC_API_KEY`
+is the opt-in — there is no separate enable flag. With **no key** the app still
+runs: LLM calls return nothing and the deterministic query parser + deterministic
+scoring stand in (with less semantic nuance). There is **no Groq / OpenRouter
+fallback**.
 
-## Stack
+## General query understanding
 
-| | |
-|---|---|
-| Backend | Python 3.11 · FastAPI · Pydantic v2 · SQLAlchemy 2 · SQLite (Postgres-ready via `DATABASE_URL`) |
-| Frontend | Vite · React · TypeScript · Tailwind · TanStack Query |
-| Profile data | Apify actor `harvestapi/linkedin-profile-scraper` (`LpVuK3Zozwuipa5bp`), *Profile details no email* — never enables email search, never switches to a costlier mode |
-| LLM | Anthropic (primary, paid) -> Groq -> OpenRouter (`:free`) -> deterministic fallback, per step |
-| Embeddings | `sentence-transformers/all-MiniLM-L6-v2`, local, numpy brute-force cosine — no key, no cost |
+The query-interpretation call uses a **two-stage** plan pipeline:
+
+```
+natural-language query
+  → Anthropic  (raw JSON reply)
+  → LenientSearchPlan / LenientSearchCriterion   (tolerant transport schema)
+  → query_transport.repair_plan()               (STRUCTURAL repair only)
+  → ParsedSearchQuery.model_validate()           (the STRICT internal schema)
+  → deterministic fact validation                (explicit locations / companies / OR / NOT survive)
+  → the search engine
+```
+
+**Why the tolerant transport layer exists.** Claude legitimately returns a
+semantically correct plan with harmless representation quirks — `operator: null`
+(it used `concept`/`values` instead), a missing `id`, `values` as a bare string,
+a string `weight`, no `modality`. Feeding that straight into the strict schema
+used to fail validation, retry the identical request three times, and then fall
+back to the keyword-only parser — losing constraints the model had understood.
+`repair_plan` now normalizes representation only (null operator → `ANY_OF`,
+cross-fill `value`/`values`/`concept`, synthesize a missing id, numeric weight,
+type-alias spelling) and **never invents a value the model did not supply**. The
+strict `ParsedSearchQuery` still validates the repaired plan before it reaches
+the search engine. A genuine failure (non-JSON, no criteria, provider error)
+still falls back to the deterministic parser.
+
+Explicit facts are casing-invariant: *"engineers in Atlanta"*, *"engineers in
+atlanta"* and *"ENGINEERS IN ATLANTA"* produce the same required location
+constraint (a generic profession/domain denylist, not a city list, keeps *"in
+sales"* / *"in leadership"* from being read as places).
+
+## Search behavior
+
+- Query interpretation → full local scan of every connection (`<= FULL_SCAN_MAX_CONNECTIONS`)
+- **Hard-fact viability gate** — rejects a candidate only on a *verified*
+  contradiction (e.g. a required location that clearly conflicts with the known
+  one). `UNKNOWN` is never treated as `FALSE`.
+- Local pre-score from stored facts + cached company classification + the stored
+  semantic representation — this resolves most criteria for most candidates with
+  no query-time LLM call.
+- **Semantic judge** (Anthropic) for candidates that still have an unresolved
+  *required* semantic concept — batched, with adaptive splitting if a batch
+  response is truncated (never a blind identical retry).
+- Fact-consistency validator — every judge verdict is checked against real
+  evidence before it can move a score.
+- Deterministic rescore → **Exact / Possible / Not-Match** qualification →
+  `MIN_MATCH_SCORE` filter → cross-encoder rerank **within** tiers.
+- **Final audit** (Anthropic) over the shown pool — can keep / downgrade /
+  remove, never invents a fact, never promotes Possible → Exact.
+- Grounded explanations, then the Top `TOP_CONNECTIONS` + near-matches are persisted.
+
+A broad semantic query over a large network can involve many Anthropic calls
+(the judge batches every viable candidate that still has an unresolved required
+concept) and can take a while. `SEARCH_LLM_MAX_CALLS` (soft call cap) and
+`SEARCH_MAX_SECONDS` (wall-clock budget for the *optional* LLM stages) bound the
+cost; deterministic scoring always runs to completion regardless.
+
+## Result correctness
+
+- **Stored facts are authoritative.** The LLM understands the *query*; it does
+  not supply *profile* facts.
+- **The LLM cannot invent evidence.** Every judge / audit reference is validated
+  against the real profile; an invalid one is dropped.
+- **`UNKNOWN` ≠ `FALSE`.** Missing evidence never becomes a fabricated match.
+- **Exact** = every required criterion is verified true. **Possible** = no
+  required criterion is false but at least one required *semantic* criterion is
+  still uncertain.
+- The **match score** is deterministic application logic. **Data confidence** is
+  a separate signal (profile completeness), never mixed into the score.
+- If AI verification is only **partial** (the judge or the final audit could not
+  fully complete — e.g. no LLM key, provider error, time budget reached), the
+  search still returns its conservative deterministic results with a
+  *"some AI verification was unavailable; uncertain results are shown
+  conservatively"* note. A search is **never** blanked out just because a review
+  was incomplete.
+
+## Search universe
+
+Search covers **only the LinkedIn connections you uploaded**. It never scrapes
+arbitrary LinkedIn users and it never calls Apify. Reloading a saved search
+replays the exact stored response with **zero** LLM / embedding / Apify calls.
 
 ## Setup
+
+**Requirements:** Python 3.11, Node + npm.
 
 ```bash
 git clone <this repo>
@@ -42,16 +165,14 @@ Edit `backend/.env` and set, at minimum:
 ```
 APIFY_API_TOKEN=...       # https://console.apify.com/account/integrations
 ANTHROPIC_API_KEY=...     # https://console.anthropic.com/settings/keys
+ANTHROPIC_MODEL=claude-haiku-4-5-20251001
 USE_FIXTURES=false        # false = real Apify enrichment
 ```
 
-A normal Anthropic API key works as-is — `ANTHROPIC_WORKSPACE_ID` is only needed for
-an identity-linked key tied to multiple workspaces, and `ENABLE_PAID_LLM` is a
-deprecated no-op kept for old `.env` files (a configured `ANTHROPIC_API_KEY` **is** the
-opt-in). `GROQ_API_KEY` / `OPENROUTER_API_KEY` are optional free fallbacks.
-
-`backend/.env` is gitignored and must never be committed — the app reads secrets only
-from that local file / real environment variables, never from source.
+`backend/.env` is gitignored and must never be committed — the app reads secrets
+only from that local file / real environment variables, never from source.
+`ANTHROPIC_WORKSPACE_ID` is only needed for an identity-linked key tied to
+multiple workspaces.
 
 ### Run it
 
@@ -62,7 +183,7 @@ from that local file / real environment variables, never from source.
 or manually:
 
 ```bash
-# backend  ->  http://localhost:8010   (docs at /docs)
+# backend  ->  http://localhost:8010   (OpenAPI docs at /docs)
 cd backend
 py -3.11 -m venv .venv
 .venv/Scripts/pip install -r requirements.txt
@@ -70,108 +191,107 @@ py -3.11 -m venv .venv
 ```
 
 ```bash
-# frontend  ->  http://localhost:5182   (proxies /api/* -> :8010)
+# frontend ->  http://localhost:5182   (proxies /api/* -> http://localhost:8010)
 cd frontend
 npm install
 npm run dev
 ```
 
-Then open **http://localhost:5182**, upload your `Connections.csv`, click **Enrich**,
-and search.
+Then open **http://localhost:5182**, upload your `Connections.csv`, click
+**Enrich**, and search.
 
-## Enrichment call flow (one-time per connection, cached)
+## Required / notable environment variables
 
-```
-CSV -> parse (skip export preamble) -> canonicalize URLs -> dedupe by public id
-    -> dataset + people (is_connection=true)
-    -> enrichment worker (resumable, batched):
-         Apify -> raw_profiles (verbatim)
-         -> deterministic normalize -> experiences/education/skills + completeness
-         -> Anthropic semantic pass (role/industry meaning, leadership/mentoring
-            signals, inferred skills w/ evidence) — cached by semantic_profile_version;
-            re-run only if the raw profile materially changed or the version bumps.
-            An Anthropic failure NEVER re-triggers Apify — the scrape stays, semantics
-            are retried later.
-         -> cached company classification (once per employer, reused by every
-            person who worked there — never one call per person)
-         -> local embedding
-         -> READY
-```
+See `.env.example` for the full commented list. The ones that matter:
 
-## Search call flow (every query, budget-aware)
-
-```
-query
-  -> Anthropic query interpretation (or deterministic parser)
-  -> full local scan of every connection (<= FULL_SCAN_MAX_CONNECTIONS)
-  -> hard-fact viability gate (verified contradictions only)
-  -> local pre-score: stored facts + cached company classification + stored
-     ProfileSemantic (role/industry/leadership signals) resolve MOST candidates
-     to TRUE/FALSE without any query-time LLM call
-  -> Anthropic semantic judge — ONLY for candidates with a genuinely unresolved
-     REQUIRED semantic criterion; batched, with adaptive splitting if a batch's
-     response is truncated (never a blind identical retry)
-  -> fact-consistency validator (every verdict checked against real evidence
-     before it can change a result)
-  -> deterministic rescore -> qualification (Exact / Possible / Not Match)
-  -> cross-encoder rerank within tiers
-  -> final Anthropic audit over the shown pool (batched) — can downgrade or
-     remove, never invents a fact, never promotes Possible -> Exact
-  -> ONE batched Anthropic call writes the display reasons for the top results
-  -> persisted Top 20 + near matches
-```
-
-Search **never** calls Apify. A saved search reload **never** re-runs any LLM,
-embedding, judge, or audit step — it replays the exact response that was first
-returned.
-
-Because most candidates are already decided from stored facts and semantics, a
-~1,000-connection network does **not** turn a broad query into ~100 Anthropic calls —
-only the genuinely ambiguous candidates reach the judge. An optional
-`SEARCH_LLM_MAX_CALLS` soft budget can cap query-time LLM spend further; if it's hit,
-deterministic results still stand and the UI marks verification as partial — it never
-silently pretends a review was complete. `SEARCH_MAX_SECONDS` is the same idea for wall
-time: a very broad or difficult query stops starting new judge/audit batches once the
-deadline passes and returns partial-but-useful results instead of hanging.
+| Variable | Purpose |
+|---|---|
+| `APIFY_API_TOKEN` | Real profile enrichment (unused when `USE_FIXTURES=true`) |
+| `ANTHROPIC_API_KEY` | The only external LLM. Empty = deterministic-only. |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` |
+| `USE_FIXTURES` | `false` for real Apify; `true` uses local fixture profiles ($0) |
+| `DATABASE_URL` | `sqlite:///./data/app.db` (swap for a Postgres DSN to move off SQLite) |
+| `SEARCH_LLM_MAX_CALLS` | `0` = unlimited; a positive value soft-caps query-time LLM calls |
+| `SEARCH_MAX_SECONDS` | wall-clock budget for the *optional* LLM search stages; `<= 0` disables it |
+| `SEMANTIC_JUDGE_MODE` | `all_viable` (default) / `uncertain_only` / `off` |
+| `FINAL_RESULT_AUDIT_ENABLED` | `true` (default) |
+| `TOP_CONNECTIONS` | result count (default 20) |
+| `CANDIDATE_POOL_SIZE`, `MIN_MATCH_SCORE`, `RERANKER_ENABLED`, `PROFILE_TTL_DAYS` | search / enrichment tuning |
 
 ## Cost
 
-Apify: pay-per-event, ~`$0.004`/profile (`$4` per 1,000) on the *Profile details – no
-email* tier — a one-time cost per connection, re-used until `PROFILE_TTL_DAYS` expires.
-Fixture mode (`USE_FIXTURES=true`, what the automated tests always use) is $0.
+- **Apify:** pay-per-event, ~`$0.004`/profile (`$4` per 1,000) on the *Profile
+  details – no email* tier — a one-time cost per connection, reused until
+  `PROFILE_TTL_DAYS` expires. Fixture mode is `$0`.
+- **Anthropic:** paid, billed per the model in `ANTHROPIC_MODEL`. Actual spend
+  depends on network size and query breadth. `backend/eval/pilot/` has an
+  offline harness that estimates call counts before a live run.
+- **Local embeddings + reranker:** no API, no cost.
 
-Anthropic: paid, billed by Anthropic per the model in `ANTHROPIC_MODEL`. Actual spend
-depends on network size and query breadth; see `SEARCH_LLM_MAX_CALLS` above to cap it,
-and `backend/eval/pilot/` for an offline harness that estimates call counts before any
-live run. Optional `GROQ_API_KEY` / `OPENROUTER_API_KEY` fallbacks are free-tier.
+No fixed latency or per-query call-count is guaranteed — a broad semantic search
+over a large network can take minutes and many Anthropic calls.
 
 ## Tests
 
 ```bash
-cd backend && .venv/Scripts/python -m pytest
-cd frontend && npm test -- --run
-cd frontend && npx tsc --noEmit
+cd backend  && python -m pytest          # 409 passing
+cd frontend && npm test -- --run         # 13 passing
+cd frontend && npx tsc --noEmit          # clean
+cd frontend && npm run build             # succeeds
 ```
 
-No test suite makes a live Apify or LLM call — every provider is mocked or disabled.
+No test makes a live Apify or Anthropic call — every provider is mocked or the
+key is cleared.
 
 ## Resuming an interrupted enrichment run
 
-Enrichment is resumable and batched. If the LLM quota / budget runs out mid-run, the
+Enrichment is resumable and batched. If the LLM is unavailable mid-run, the
 semantic step is deferred for the rest of the run — profiles are still scraped,
-normalized, embedded, and marked READY. Click **Resume** later; it runs a
-`backfill_semantics` pass for anyone still missing the current semantic version —
-nothing is ever re-scraped just because semantics failed.
+normalized, embedded, and marked READY. Click **Resume** (or re-`POST` to
+`/datasets/{id}/enrich`) later; it runs a semantic-backfill pass for anyone
+missing the current semantic version — **nothing is re-scraped just because
+semantics failed**.
 
-`scripts/reset_dataset.py <dataset_id>` wipes a dataset's derived data back to PENDING
-(keeps the CSV rows) if a run went wrong.
+`python -m scripts.reset_dataset <dataset_id>` wipes a dataset's derived data
+back to PENDING (keeps the CSV rows) if a run went wrong.
 
-## Config knobs (`.env`)
+## Project structure
 
-See `.env.example` for the full, commented list. Notable ones:
+```
+backend/
+  app/
+    routers/      FastAPI endpoints (datasets, enrich, people, search, health)
+    services/
+      llm/        Anthropic client + generic router (retries, circuit breaker)
+      query_interpreter.py / query_transport.py / query_facts.py / query_intent.py
+      candidate_gate.py / scoring.py / semantic_judge.py / judge_validator.py
+      final_auditor.py / reranker.py / reason_generator.py / search_service.py
+      enrichment_runner.py / normalize.py / semantic_enrich.py / embeddings.py
+      apify_client.py / company_intel.py / export_service.py / …
+    models.py / schemas.py / config.py / database.py / repositories.py
+  tests/          pytest suite
+  eval/pilot/     offline benchmark / call-count estimation harness
+  fixtures/       sample CSV + hand-written profile JSON (USE_FIXTURES=true)
+  scripts/        one-off maintenance scripts (reset / backfill)
+frontend/
+  src/pages/      Upload / Enrichment / Dashboard / Search / Results
+  src/components/ ResultCard, shared UI
+  src/api/        typed client + response types
+```
 
-`USE_FIXTURES` · `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` / `ANTHROPIC_WORKSPACE_ID` ·
-`GROQ_API_KEY` / `OPENROUTER_API_KEY` (optional fallbacks) · `SEARCH_LLM_MAX_CALLS` ·
-`SEARCH_MAX_SECONDS` ·
-`SEMANTIC_JUDGE_MODE` · `FINAL_RESULT_AUDIT_ENABLED` · `TOP_CONNECTIONS` ·
-`CANDIDATE_POOL_SIZE` · `MIN_MATCH_SCORE` · `EMBEDDINGS_ENABLED` · `PROFILE_TTL_DAYS`.
+## Safety / data behavior
+
+- `backend/.env` is never committed; the app reads secrets only from it / real env vars.
+- All raw and derived profile data is stored **locally** in `backend/data/app.db`.
+- Search operates only on **your uploaded connections** — no arbitrary LinkedIn scraping.
+- Search makes **zero** Apify calls. A saved-search reload makes **zero**
+  external calls of any kind.
+
+## Current limitations
+
+- Local / single-user MVP: SQLite, no auth, no multi-tenancy.
+- Windows-first tooling (`run.ps1`); the manual commands work on any OS.
+- The Anthropic client uses the pre-Claude-5 request shape — use a Claude 4.x
+  model (`claude-haiku-4-5-20251001` by default).
+- A broad semantic query over a large network is not fast and can consume a
+  meaningful number of Anthropic calls.
