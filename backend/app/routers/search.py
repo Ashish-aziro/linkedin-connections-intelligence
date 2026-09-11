@@ -14,9 +14,25 @@ router = APIRouter(tags=["search"])
 def run_search(payload: SearchRequest, db: Session = Depends(get_db)) -> SearchResponse:
     if not repo.get_dataset(db, payload.dataset_id):
         raise HTTPException(404, "dataset not found")
+    from app.services.full_verification import VerificationIncompleteError
     from app.services.search_service import run_connection_search
 
-    resp = run_connection_search(db, dataset_id=payload.dataset_id, query=payload.query)
+    try:
+        resp = run_connection_search(db, dataset_id=payload.dataset_id, query=payload.query)
+    except VerificationIncompleteError as e:
+        # FULL SONNET VERIFICATION could not complete for every filtered candidate.
+        # Nothing was persisted — the whole search is a retryable failure, never a
+        # partial/unverified result set.
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "verification_incomplete",
+                "message": "Full Sonnet verification could not be completed. Please retry.",
+                "retryable": True,
+                "verification": e.metadata,
+            },
+        ) from e
     db.commit()
     return resp
 

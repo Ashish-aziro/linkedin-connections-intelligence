@@ -69,6 +69,7 @@ def build_packets(
     bundle: list[tuple], parsed: ParsedSearchQuery, ctx: ScoringContext, *, query: str,
     max_packet_chars: int | None = None,
     unresolved_by_person: dict[str, list[str]] | None = None,
+    full_profile: bool = False,
 ) -> list[dict]:
     """``bundle``: ``[(person, ProfileFacts, {"volunteering": [...], "recommendations": [...]})]``.
     Returns one packet dict per candidate (same order). ``max_packet_chars``
@@ -82,8 +83,9 @@ def build_packets(
     want_academia_context = bool(toks & _ACADEMIA_TOKENS)
     packets = [
         _one_packet(person, facts, extras, ctx, toks,
-                    want_mentor_context=want_mentor_context, want_academia_context=want_academia_context,
-                    max_packet_chars=max_packet_chars)
+                    want_mentor_context=want_mentor_context or full_profile,
+                    want_academia_context=want_academia_context or full_profile,
+                    max_packet_chars=max_packet_chars, full_profile=full_profile)
         for person, facts, extras in bundle
     ]
     if unresolved_by_person is not None:
@@ -143,12 +145,14 @@ def packet_experience_current_map(packet: dict) -> dict[str, bool]:
 
 def _one_packet(person, facts: ProfileFacts, extras: dict, ctx: ScoringContext, toks: set[str],
                 *, want_mentor_context: bool, want_academia_context: bool,
-                max_packet_chars: int | None = None) -> dict:
+                max_packet_chars: int | None = None, full_profile: bool = False) -> dict:
     exps = list(reversed(ordered_experiences(list(facts.experiences))))  # newest first
     current = next((e for e in exps if getattr(e, "is_current", False)), None)
     past = [e for e in exps if not getattr(e, "is_current", False)]
     past.sort(key=lambda e: _matches(f"{e.position} {e.company_name} {e.description}", toks), reverse=True)
-    keep_past = past[:8]
+    # FULL SONNET VERIFICATION — keep EVERY career row (compaction, not omission,
+    # handles size); the legacy judge keeps only the 8 most query-relevant.
+    keep_past = past if full_profile else past[:8]
 
     def _exp_row(e, *, full: bool) -> dict:
         rel = _matches(f"{e.position} {e.company_name} {e.description}", toks) > 0
@@ -232,6 +236,21 @@ def _one_packet(person, facts: ProfileFacts, extras: dict, ctx: ScoringContext, 
         "headline": person.headline,
         "location": person.location_text,
         "career_summary": sem.get("career_summary"),
+        **({
+            "name": person.full_name,
+            "about": (person.about or "")[:1200] or None,
+            "current_title": person.current_title,
+            "current_company": person.current_company,
+            "languages": [
+                {"name": getattr(lg, "name", None), "proficiency": getattr(lg, "proficiency", None)}
+                for lg in (getattr(facts, "languages", []) or [])
+            ] or None,
+            "industries": (sem.get("industries") or [])[:8] or None,
+            "job_families": (sem.get("job_families") or [])[:8] or None,
+            "role_functions": (sem.get("role_functions") or sem.get("technical_domains") or [])[:8] or None,
+            "domain_expertise": (sem.get("domain_expertise") or [])[:8] or None,
+            "leadership_experience": (sem.get("leadership_experience") or [])[:6] or None,
+        } if full_profile else {}),
         "current": _exp_row(current, full=True) if current else None,
         "past": [_exp_row(e, full=False) for e in keep_past],
         "experience_semantics": exp_sem_rows,

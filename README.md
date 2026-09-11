@@ -7,6 +7,37 @@ could help me raise funding for an AI startup"* and get a ranked shortlist of th
 **people you already know**, each with an evidence-backed match score, a grounded
 explanation, and a separate data-confidence score.
 
+> ## ⚠️ Branch: `feature/full-sonnet-verification` — FULL SONNET VERIFICATION EXPERIMENT
+>
+> On this branch **every candidate that survives the deterministic hard-fact
+> filter is reviewed by Claude Sonnet 4.6** against the whole search plan before
+> a search can return successfully.
+>
+> - A successful search returns **only fully-reviewed candidates** whose every
+>   *required* criterion verified **TRUE**. There is no *"some AI verification was
+>   unavailable"* banner and no *"Possible / needs verification"* card.
+> - A candidate whose review completes but lacks the evidence to establish a
+>   required claim (`INSUFFICIENT_EVIDENCE`) is **excluded** from results, not
+>   shown conservatively.
+> - If full Sonnet verification **cannot complete** (API error, unrecoverable
+>   truncation, missing output …) after bounded retry/split/chunk recovery, the
+>   **whole search fails** with a retryable error (`HTTP 503`,
+>   `{"error":"verification_incomplete","retryable":true}`) and the UI shows a
+>   *"Full AI verification could not be completed — Retry search"* screen. It
+>   never shows partially-verified candidates.
+> - Facts stay authoritative: Sonnet verifies *meaning* against validated
+>   evidence — it does not invent profile facts and does not choose the numeric
+>   score (deterministic application code does).
+>
+> This is intentionally **higher accuracy / higher confidence** at the cost of
+> **more Anthropic usage and higher latency** (see *Cost & latency* below). Turn
+> it off with `FULL_LLM_VERIFICATION=false` to fall back to the legacy
+> "semantic-judge-only-where-unresolved + conservative partial results" path.
+>
+> **The completed, stable phase is the branch/tag `phase-complete-2026-09-10`**
+> (`main` is unchanged). Switch back any time:
+> `git checkout phase-complete-2026-09-10`.
+
 ## What it does
 
 ```
@@ -22,12 +53,12 @@ Connections.csv
   → natural-language search
        → Anthropic understands the query → structured search plan
        → full scan of your connections → hard-fact viability gate
-       → deterministic evidence-based scoring
-       → semantic judge (where a required concept is still unresolved)
-       → fact-consistency validation → rescore → Exact / Possible tiers
-       → cross-encoder reranking within tiers
-       → final grounded audit → grounded explanations
-       → ranked results, persisted
+       → deterministic evidence-based pre-score
+       → FULL SONNET VERIFICATION — every filtered candidate reviewed by Sonnet
+         (batched, with retry / split / single-person / chunked recovery)
+       → fact-consistency validation → deterministic rescore → Exact tier only
+       → cross-encoder reranking → final grounded audit → grounded explanations
+       → verified results, persisted   (or HTTP 503 verification_incomplete)
 ```
 
 ## Key capabilities
@@ -99,31 +130,50 @@ atlanta"* and *"ENGINEERS IN ATLANTA"* produce the same required location
 constraint (a generic profession/domain denylist, not a city list, keeps *"in
 sales"* / *"in leadership"* from being read as places).
 
-## Search behavior
+## Search behavior (this branch — full Sonnet verification)
 
-- Query interpretation → full local scan of every connection (`<= FULL_SCAN_MAX_CONNECTIONS`)
+- Query interpretation (Anthropic) → deterministic fact validation → full local
+  scan of every connection (`<= FULL_SCAN_MAX_CONNECTIONS`)
 - **Hard-fact viability gate** — rejects a candidate only on a *verified*
   contradiction (e.g. a required location that clearly conflicts with the known
-  one). `UNKNOWN` is never treated as `FALSE`.
-- Local pre-score from stored facts + cached company classification + the stored
-  semantic representation — this resolves most criteria for most candidates with
-  no query-time LLM call.
-- **Semantic judge** (Anthropic) for candidates that still have an unresolved
-  *required* semantic concept — batched, with adaptive splitting if a batch
-  response is truncated (never a blind identical retry).
-- Fact-consistency validator — every judge verdict is checked against real
-  evidence before it can move a score.
+  one). `UNKNOWN` is never treated as `FALSE`. Everyone else is a **filtered
+  candidate**.
+- Local deterministic pre-score (stored facts + cached company classification +
+  stored semantic representation).
+- **Full Sonnet verification** — a complete, evidence-referenced full-profile
+  packet is built for **every filtered candidate** and Sonnet reviews the whole
+  search plan for each. Batched; a truncated batch is split in half; a candidate
+  omitted from a batch is retried alone; a candidate too large to fit is broken
+  into per-required-criterion targeted calls. Per criterion the verdict is
+  `TRUE` / `FALSE` / `INSUFFICIENT_EVIDENCE` (all *completed* reviews), and a
+  separate technical `VERIFICATION_FAILED` when no usable answer was obtained.
+- Fact-consistency validator — every verdict + evidence reference is checked
+  against that person's exact packet and the locked deterministic facts before
+  it can move a score. **Factual criteria (company / location / education /
+  certification / language / chronology) stay backend-authoritative.**
 - Deterministic rescore → **Exact / Possible / Not-Match** qualification →
   `MIN_MATCH_SCORE` filter → cross-encoder rerank **within** tiers.
-- **Final audit** (Anthropic) over the shown pool — can keep / downgrade /
-  remove, never invents a fact, never promotes Possible → Exact.
-- Grounded explanations, then the Top `TOP_CONNECTIONS` + near-matches are persisted.
+- **Display eligibility:** only candidates whose review completed with every
+  *required* criterion `TRUE` reach the results. A required
+  `INSUFFICIENT_EVIDENCE` excludes the candidate (recorded in metadata, not
+  shown).
+- **Final audit** (Anthropic) still runs over the shown pool as a last grounded
+  correctness check (keep / downgrade / remove only). Because every shown
+  candidate is already fully verified it is advisory here — an incomplete audit
+  does **not** fail the search.
+- Grounded explanations, then the Top `TOP_CONNECTIONS` are persisted.
 
-A broad semantic query over a large network can involve many Anthropic calls
-(the judge batches every viable candidate that still has an unresolved required
-concept) and can take a while. `SEARCH_LLM_MAX_CALLS` (soft call cap) and
-`SEARCH_MAX_SECONDS` (wall-clock budget for the *optional* LLM stages) bound the
-cost; deterministic scoring always runs to completion regardless.
+**If verification cannot complete** for any filtered candidate's required
+criteria after bounded recovery, `run_connection_search` raises
+`VerificationIncompleteError` → the `/search` endpoint returns
+`HTTP 503 {"error":"verification_incomplete","retryable":true}` and **nothing is
+persisted** — it is a retryable failure, never a partial result.
+
+Observability (backend metadata / `judge_metadata` block): filtered vs verified
+candidate counts, criteria reviewed, batch/split/single-retry/chunk/targeted-call
+counts, total LLM calls, model, `excluded_false`, `excluded_insufficient_evidence`.
+Invariant enforced at the orchestration layer: a *successful* full-verification
+search has `filtered_candidate_count == sonnet_verified_candidate_count`.
 
 ## Result correctness
 
@@ -165,7 +215,7 @@ Edit `backend/.env` and set, at minimum:
 ```
 APIFY_API_TOKEN=...       # https://console.apify.com/account/integrations
 ANTHROPIC_API_KEY=...     # https://console.anthropic.com/settings/keys
-ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+ANTHROPIC_MODEL=claude-sonnet-4-6
 USE_FIXTURES=false        # false = real Apify enrichment
 ```
 
@@ -208,7 +258,7 @@ See `.env.example` for the full commented list. The ones that matter:
 |---|---|
 | `APIFY_API_TOKEN` | Real profile enrichment (unused when `USE_FIXTURES=true`) |
 | `ANTHROPIC_API_KEY` | The only external LLM. Empty = deterministic-only. |
-| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` (FULL SONNET VERIFICATION EXPERIMENT) |
 | `USE_FIXTURES` | `false` for real Apify; `true` uses local fixture profiles ($0) |
 | `DATABASE_URL` | `sqlite:///./data/app.db` (swap for a Postgres DSN to move off SQLite) |
 | `SEARCH_LLM_MAX_CALLS` | `0` = unlimited; a positive value soft-caps query-time LLM calls |
@@ -228,13 +278,23 @@ See `.env.example` for the full commented list. The ones that matter:
   offline harness that estimates call counts before a live run.
 - **Local embeddings + reranker:** no API, no cost.
 
-No fixed latency or per-query call-count is guaranteed — a broad semantic search
-over a large network can take minutes and many Anthropic calls.
+**Cost & latency on this branch.** Full Sonnet verification reviews *every*
+filtered candidate. A search with *N* candidates past the hard-fact gate needs
+roughly `ceil(N / FULL_VERIFICATION_BATCH_SIZE)` Sonnet calls on the happy path
+(default batch size 6 → ~1 call per 6 candidates), plus one interpretation call,
+plus a handful more for any batch that truncates/splits, any candidate retried
+alone, and any oversized candidate's per-criterion targeted calls, plus the final
+audit + one reason call. So a query that filters to ~30 candidates is ~6–12
+Sonnet calls; a very broad query on a ~1,000-person network that leaves hundreds
+viable can be **many dozens to a few hundred** Sonnet calls and take **several
+minutes**. There is no per-query call cap and (with `FULL_VERIFICATION_MAX_SECONDS=0`)
+no wall-clock cutoff — verification is mandatory. Use a narrower query, or
+`FULL_LLM_VERIFICATION=false`, if that cost is not acceptable.
 
 ## Tests
 
 ```bash
-cd backend  && python -m pytest          # 409 passing
+cd backend  && python -m pytest          # 419 passing
 cd frontend && npm test -- --run         # 13 passing
 cd frontend && npx tsc --noEmit          # clean
 cd frontend && npm run build             # succeeds
@@ -291,7 +351,6 @@ frontend/
 
 - Local / single-user MVP: SQLite, no auth, no multi-tenancy.
 - Windows-first tooling (`run.ps1`); the manual commands work on any OS.
-- The Anthropic client uses the pre-Claude-5 request shape — use a Claude 4.x
-  model (`claude-haiku-4-5-20251001` by default).
+- The Anthropic client uses the pre-Claude-5 request shape; `ANTHROPIC_MODEL` defaults to `claude-sonnet-4-6` on this branch. If your account/model needs the newer request shape, adjust `llm/anthropic_client.py`.
 - A broad semantic query over a large network is not fast and can consume a
   meaningful number of Anthropic calls.

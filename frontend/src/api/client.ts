@@ -8,17 +8,39 @@ import type {
 
 const BASE = "/api";
 
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+  constructor(status: number, detail: unknown, message: string) {
+    super(message);
+    this.status = status;
+    this.detail = detail;
+  }
+  /** FastAPI `detail` may be a string or a structured object. */
+  get code(): string | undefined {
+    return typeof this.detail === "object" && this.detail !== null
+      ? (this.detail as Record<string, unknown>).error as string | undefined
+      : undefined;
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, init);
   if (!res.ok) {
-    let detail = res.statusText;
+    let detail: unknown = res.statusText;
     try {
       const body = await res.json();
-      detail = body.detail ?? JSON.stringify(body);
+      detail = body.detail ?? body;
     } catch {
       /* ignore */
     }
-    throw new Error(`${res.status}: ${detail}`);
+    const msg =
+      typeof detail === "object" && detail !== null && "message" in (detail as object)
+        ? String((detail as Record<string, unknown>).message)
+        : typeof detail === "string"
+          ? detail
+          : JSON.stringify(detail);
+    throw new ApiError(res.status, detail, `${res.status}: ${msg}`);
   }
   if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;

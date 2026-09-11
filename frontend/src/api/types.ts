@@ -196,23 +196,35 @@ export interface SearchResponse {
   // V4 PART 3 §32 — observability for the exhaustive semantic-judge run.
   // Absent on searches that did not run the judge; frontend rendering comes later.
   judge_metadata?: {
-    mode: "off" | "uncertain_only" | "all_viable";
-    status: "full" | "partial" | "not_used" | "unavailable";
+    // "full_verification" -> the FULL SONNET VERIFICATION experiment; every
+    // filtered candidate was reviewed by Sonnet (status "complete").
+    mode: "off" | "uncertain_only" | "all_viable" | "full_verification";
+    status: "full" | "partial" | "not_used" | "unavailable" | "complete" | "incomplete";
     network_size: number;
     candidate_pool_size: number;
     hard_fact_rejected_count: number;
-    viable_candidate_count: number;
+    viable_candidate_count?: number;
     judge_candidate_count: number;
     judge_batch_count: number;
     judge_successful_batches: number;
     judge_failed_batches: number;
-    capped: boolean;
-    omitted_people: number;
+    capped?: boolean;
+    omitted_people?: number;
     omitted_criteria: number;
-    // V4 PART 3.6 §8 — packets too large to judge (subset of omitted_people)
     oversized_packets?: number;
     providers: Record<string, number>;
     models: string[];
+    // ── FULL SONNET VERIFICATION extras ──
+    filtered_candidate_count?: number;
+    sonnet_verified_candidate_count?: number;
+    criteria_reviewed?: number;
+    single_person_retries?: number;
+    chunked_profile_reviews?: number;
+    targeted_criterion_calls?: number;
+    total_llm_calls?: number;
+    excluded_false?: number;
+    excluded_insufficient_evidence?: number;
+    model?: string;
   } | null;
   // V4 PART 5 §25 — observability for the final result audit. Live-response
   // only for now (persistence + UI are PART 7-9).

@@ -17,6 +17,10 @@ os.environ["LLM_REASON_GENERATION"] = "false"
 # V4 PART 5 — the final audit is an LLM path; off by default in tests (like the
 # reason generator). Audit tests enable it and mock final_auditor._audit_batch.
 os.environ["FINAL_RESULT_AUDIT_ENABLED"] = "false"
+# FULL SONNET VERIFICATION is an LLM path — off by default in the general suite
+# (it would 503 every search with no key). The dedicated full-verification tests
+# turn it on and mock the Sonnet batch call.
+os.environ["FULL_LLM_VERIFICATION"] = "false"
 os.environ["DEVELOPMENT_BATCH_SIZE"] = "3"
 # no test may make a live external call — hard-clear every provider key so a
 # real backend/.env can never leak a key into the test process (a test that

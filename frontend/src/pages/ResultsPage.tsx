@@ -133,9 +133,11 @@ export default function ResultsPage() {
 
   const conn = res.connections;
   const nearMatches = conn.near_matches ?? [];
+  const fullVerification = res.judge_metadata?.mode === "full_verification";
   const verificationDegraded =
-    DEGRADED.has(res.judge_metadata?.status ?? "") ||
-    (res.audit_metadata?.enabled === true && DEGRADED.has(res.audit_metadata?.status ?? ""));
+    !fullVerification &&
+    (DEGRADED.has(res.judge_metadata?.status ?? "") ||
+      (res.audit_metadata?.enabled === true && DEGRADED.has(res.audit_metadata?.status ?? "")));
 
   return (
     <div>
@@ -179,9 +181,15 @@ export default function ResultsPage() {
             Your connections
           </h2>
           <span className="flex items-center gap-2 text-xs text-ink-faint">
-            <Badge tone="fact">{conn.exact_match_count ?? 0} Exact</Badge>
-            <Badge tone="warn">{conn.possible_match_count ?? 0} Possible</Badge>
-            <span>{conn.returned} shown</span>
+            {fullVerification ? (
+              <Badge tone="fact">{conn.returned} Verified {conn.returned === 1 ? "Match" : "Matches"}</Badge>
+            ) : (
+              <>
+                <Badge tone="fact">{conn.exact_match_count ?? 0} Exact</Badge>
+                <Badge tone="warn">{conn.possible_match_count ?? 0} Possible</Badge>
+                <span>{conn.returned} shown</span>
+              </>
+            )}
           </span>
         </div>
 

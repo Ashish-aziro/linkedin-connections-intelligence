@@ -143,6 +143,40 @@ class JudgeMode:
 ALL_JUDGE_MODES = {JudgeMode.OFF, JudgeMode.UNCERTAIN_ONLY, JudgeMode.ALL_VIABLE}
 
 
+class VerdictState:
+    """FULL SONNET VERIFICATION — the per-criterion outcome of a *completed*
+    Sonnet review, kept distinct from a technical failure.
+
+      TRUE                  evidence positively supports the criterion
+      FALSE                 evidence clearly contradicts / disproves it
+      INSUFFICIENT_EVIDENCE Sonnet reviewed the available evidence but the
+                            profile does not establish the claim — a VALID,
+                            completed review (maps to the legacy tri-state
+                            ``unknown``; it is NOT a failure)
+      VERIFICATION_FAILED   we never got a usable, validated answer (API error,
+                            rate limit, timeout, truncation that could not be
+                            recovered, missing person/criterion output,
+                            unrepairable validation failure) — NOT a completed
+                            review; must be recovered or the SEARCH fails
+    """
+
+    TRUE = "true"
+    FALSE = "false"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    VERIFICATION_FAILED = "verification_failed"
+
+    #: the completed-review states (a technical failure is none of these)
+    COMPLETED = {TRUE, FALSE, INSUFFICIENT_EVIDENCE}
+
+
+class FullVerificationStatus:
+    """Outcome of the full-verification pass for a search."""
+
+    COMPLETE = "complete"      # every filtered candidate fully reviewed
+    INCOMPLETE = "incomplete"  # a candidate/criterion could not be verified -> search fails
+    NOT_USED = "not_used"      # FULL_LLM_VERIFICATION off, or no judgeable criteria
+
+
 class JudgeStatus:
     """Outcome of the semantic-judge run for a search (V4 PART 3 §29)."""
 

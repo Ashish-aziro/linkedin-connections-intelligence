@@ -71,11 +71,14 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
 
     prof = search_profile.start()
     _wall_start = _time.perf_counter()
-    # hardening PART 14 / mission STEP 9 — ONE wall-clock budget for the whole
-    # search. Deterministic scoring always runs to completion; every OPTIONAL
-    # expensive stage (similarity, judge, rerank, audit, reason) checks it and
-    # bails to fast partial finalization once it is spent.
-    deadline = Deadline(settings.search_max_seconds)
+    full_mode = settings.full_llm_verification
+    # hardening PART 14 — wall-clock budget for a search's OPTIONAL LLM work.
+    # In FULL SONNET VERIFICATION mode verification is MANDATORY, not optional,
+    # so it uses ``full_verification_max_seconds`` (0 = unlimited) — the search
+    # never returns partial results because time ran out.
+    deadline = Deadline(
+        settings.full_verification_max_seconds if full_mode else settings.search_max_seconds
+    )
     with prof.stage("query_interpretation"):
         parsed, provider, model = interpret_query(query)
     log.info("query %r -> %d criteria (intent=%s) via %s",
@@ -145,29 +148,64 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
         }
     prof.incr("prescore_candidates", len(viable))
 
-    # ── exhaustive semantic judge (§8-§10) ───────────────────────────
+    # ── verification — EVERY hard-gate survivor is reviewed ──────────
     bundle = [
         (p, facts_by_id[p.id],
          {"volunteering": vol_by_id.get(p.id, []), "recommendations": rec_by_id.get(p.id, [])})
         for p in viable
     ]
-    with prof.stage("judge"):
-        judge_run = run_judge(
-            query, parsed, bundle, ctx,
-            network_size=total, pool_size=len(candidates),
-            hard_rejected_count=len(hard_rejected), local_scored=prescored,
-            deadline=deadline,
-        )
+    judge_run = None
+    fv_metadata: dict | None = None
+    if full_mode:
+        # FULL SONNET VERIFICATION — Sonnet reviews every filtered candidate
+        # against the whole plan. Raises VerificationIncompleteError (-> HTTP
+        # 503, retryable) if any candidate's required review cannot complete;
+        # a partial/unverified result is NEVER returned.
+        from app.services.full_verification import run_full_verification
 
-    # ── validate every verdict before it can change a score (§17) ────
-    with prof.stage("judge_validation"):
-        for pid, person_verdicts in judge_run.verdicts.items():
-            packet = judge_run.packets_by_id.get(pid)
-            if packet is None or pid not in facts_by_id:
-                continue
-            validated = validate_person(person_verdicts, packet, parsed, facts_by_id[pid], ctx)
-            if validated:
-                ctx.judge_results[pid] = validated
+        with prof.stage("full_verification"):
+            fv_run = run_full_verification(
+                query, parsed, bundle, ctx,
+                network_size=total, pool_size=len(candidates),
+                hard_rejected_count=len(hard_rejected), local_scored=prescored,
+            )
+        with prof.stage("verification_validation"):
+            for pid, person_verdicts in fv_run.verdicts.items():
+                packet = fv_run.packets_by_id.get(pid)
+                if packet is None or pid not in facts_by_id:
+                    continue
+                validated = validate_person(person_verdicts, packet, parsed, facts_by_id[pid], ctx)
+                if validated:
+                    ctx.judge_results[pid] = validated
+        fv_metadata = fv_run.metadata
+        # INVARIANT — a successful full-verification search reviewed EVERY filtered
+        # candidate. If not, treat it as an incomplete verification (retryable),
+        # never a silent partial success.
+        if fv_metadata["sonnet_verified_candidate_count"] != len(viable):
+            from app.services.full_verification import VerificationIncompleteError
+
+            raise VerificationIncompleteError(
+                f"full-verification invariant violated: filtered={len(viable)} "
+                f"verified={fv_metadata['sonnet_verified_candidate_count']}",
+                metadata=fv_metadata,
+            )
+    else:
+        with prof.stage("judge"):
+            judge_run = run_judge(
+                query, parsed, bundle, ctx,
+                network_size=total, pool_size=len(candidates),
+                hard_rejected_count=len(hard_rejected), local_scored=prescored,
+                deadline=deadline,
+            )
+        # ── validate every verdict before it can change a score (§17) ────
+        with prof.stage("judge_validation"):
+            for pid, person_verdicts in judge_run.verdicts.items():
+                packet = judge_run.packets_by_id.get(pid)
+                if packet is None or pid not in facts_by_id:
+                    continue
+                validated = validate_person(person_verdicts, packet, parsed, facts_by_id[pid], ctx)
+                if validated:
+                    ctx.judge_results[pid] = validated
 
     # ── deterministic rescore (STEP 5) — ONLY the candidates whose validated
     #    judge verdicts can actually move something are recomputed; everyone
@@ -194,12 +232,29 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
                 continue
             scored.append(r)
 
-        # hard-rejected candidates that miss only one thing — surfaced as near-matches,
-        # never judged, never in the main results
-        for p in hard_rejected:
-            r = score_candidate(facts_by_id[p.id], parsed, ctx)
-            if r.qualification == Qualification.NOT_MATCH and len(r.unmet_required) <= 2:
-                near_pool.append(r)
+        # hard-rejected candidates that miss only one thing — surfaced as
+        # near-matches. In FULL SONNET VERIFICATION mode they were NOT reviewed
+        # by Sonnet, so they are not surfaced at all (a successful result page
+        # only contains reviewed candidates).
+        if not full_mode:
+            for p in hard_rejected:
+                r = score_candidate(facts_by_id[p.id], parsed, ctx)
+                if r.qualification == Qualification.NOT_MATCH and len(r.unmet_required) <= 2:
+                    near_pool.append(r)
+
+    # ── FULL SONNET VERIFICATION display eligibility — only candidates whose
+    #    review completed AND every required criterion is TRUE (EXACT) reach the
+    #    main results. A required criterion that reviewed as INSUFFICIENT_EVIDENCE
+    #    (-> POSSIBLE_MATCH) is EXCLUDED, never shown as "Possible / needs
+    #    verification". ──────────────────────────────────────────────────────
+    if full_mode:
+        # ``scored`` already dropped rescore NOT_MATCH (they went to ``near_pool``);
+        # what is left that is not EXACT is a required INSUFFICIENT_EVIDENCE.
+        insufficient = [s for s in scored if s.qualification != Qualification.EXACT_MATCH]
+        scored = [s for s in scored if s.qualification == Qualification.EXACT_MATCH]
+        if fv_metadata is not None:
+            fv_metadata["excluded_insufficient_evidence"] = len(insufficient)
+            fv_metadata["excluded_false"] = len(near_pool)
 
     # ── NOW apply MIN_MATCH_SCORE (never before the judge, §22). A verified
     #    EXACT_MATCH is kept even with a modest numeric score. ──
@@ -282,6 +337,10 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
             audit=audit_by_id.get(cand.person.id),
             facts=facts_by_id.get(cand.person.id),
         )
+        if full_mode:
+            # every main result completed a full Sonnet review with every
+            # required criterion TRUE — a stronger signal than the audit flag.
+            item.llm_verified = True
         results.append(item)
         repo.add_search_result(
             db, search_id=sq.id, person_id=cand.person.id, bucket="connection", rank=rank,
@@ -308,7 +367,7 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
             reason=item.reason, payload=item.model_dump(),
         )
 
-    judge_metadata = judge_run.metadata.as_dict()
+    judge_metadata = fv_metadata if full_mode else judge_run.metadata.as_dict()
     audit_metadata = audit_run.metadata.as_dict() if audit_run else None
 
     # hardening PART 6 — per-search LLM call tally, no prompts/profile data.

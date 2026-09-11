@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { api } from "../api/client";
+import { AlertTriangle } from "lucide-react";
+import { api, ApiError } from "../api/client";
 import { Button, Card } from "../components/ui";
 
 const EXAMPLES = [
@@ -50,7 +51,26 @@ export default function SearchPage() {
         </div>
       </Card>
 
-      {run.error && <p className="mt-3 text-sm text-red-600">{String(run.error)}</p>}
+      {run.error &&
+        (run.error instanceof ApiError && run.error.code === "verification_incomplete" ? (
+          <Card className="mt-4 border-amber-200 bg-amber-50 px-5 py-6 text-center">
+            <AlertTriangle size={20} className="mx-auto text-amber-600" />
+            <p className="mt-2 text-sm font-medium text-amber-900">
+              Full AI verification could not be completed.
+            </p>
+            <p className="mx-auto mt-1 max-w-md text-xs text-amber-800">
+              Every candidate is reviewed by Claude Sonnet before results are shown. That review
+              did not finish — no partial results are displayed.
+            </p>
+            <div className="mt-4">
+              <Button onClick={() => run.mutate()} disabled={run.isPending}>
+                {run.isPending ? "Retrying…" : "Retry search"}
+              </Button>
+            </div>
+          </Card>
+        ) : (
+          <p className="mt-3 text-sm text-red-600">{String(run.error)}</p>
+        ))}
 
       <div className="mt-6 flex flex-wrap gap-2">
         {EXAMPLES.map((e) => (

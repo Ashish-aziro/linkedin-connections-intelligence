@@ -32,7 +32,9 @@ class Settings(BaseSettings):
     #: — LLM calls return None and the deterministic parser / scoring stands in.
     anthropic_api_key: str = ""
     anthropic_workspace_id: str = ""  # only needed for identity-linked keys
-    anthropic_model: str = "claude-haiku-4-5-20251001"
+    #: FULL SONNET VERIFICATION EXPERIMENT — Sonnet is now the default. An env
+    #: value (ANTHROPIC_MODEL) still overrides this.
+    anthropic_model: str = "claude-sonnet-4-6"
     llm_max_retries: int = 2
     #: DEPRECATED — kept so an old .env file doesn't error. Does not gate anything.
     enable_paid_llm: bool = False
@@ -89,7 +91,31 @@ class Settings(BaseSettings):
     #: hardening PART 14 — wall-clock budget for a search's OPTIONAL LLM work
     #: (judge + audit + reason generation). Deterministic scoring is never
     #: skipped for time. <= 0 disables the deadline (unlimited).
+    #: NOTE: ignored for the verification stage when FULL_LLM_VERIFICATION is on
+    #: (verification is mandatory there, not optional).
     search_max_seconds: float = 45.0
+
+    # ── FULL SONNET VERIFICATION EXPERIMENT ─────────────────────
+    #: When True, EVERY candidate that survives the hard-fact gate is reviewed by
+    #: Claude Sonnet before a search can succeed. A candidate whose review does
+    #: not complete (API error / truncation that cannot be recovered / missing
+    #: output) fails the whole SEARCH — partial/unverified results are never
+    #: returned. The legacy "semantic judge only where unresolved + conservative
+    #: partial results" path stays available with False.
+    full_llm_verification: bool = True
+    #: per-search wall-clock ceiling for the WHOLE full-verification search.
+    #: <= 0 (default) = no application-level deadline — verification is mandatory
+    #: and runs to completion. Individual HTTP calls still have their own timeout.
+    full_verification_max_seconds: float = 0.0
+    #: bounded recovery for a candidate omitted / incomplete in a batch: retry
+    #: the candidate alone this many times before falling back to chunked review.
+    full_verification_single_retries: int = 2
+    #: split an oversized candidate's evidence into sections, review each, then
+    #: aggregate — instead of leaving them unverified.
+    full_verification_chunk_oversized: bool = True
+    #: larger per-packet budget for the full-profile verification packet.
+    full_verification_max_packet_chars: int = 14000
+    full_verification_batch_size: int = 6
 
     # ── Search quality v2 ────────────────────────────────────
     relevance_weight: float = 20.0         # points reserved for whole-profile relevance
