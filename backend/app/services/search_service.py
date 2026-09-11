@@ -296,6 +296,22 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
             )
     scored = survivors + tail
 
+    # ── FULL SONNET VERIFICATION — the final audit is a REMOVAL-ONLY brake here.
+    #    Every shown candidate already completed full Sonnet verification with
+    #    every required criterion TRUE. The audit may still REMOVE a candidate it
+    #    finds a clear contradiction for (already handled — those become
+    #    NOT_MATCH / near), but a "downgrade to POSSIBLE" must NOT produce a
+    #    "Possible match / needs verification" card — it is excluded instead. ──
+    if full_mode:
+        audit_downgraded = [s for s in scored if s.qualification != Qualification.EXACT_MATCH]
+        scored = [s for s in scored if s.qualification == Qualification.EXACT_MATCH]
+        survivors = [s for s in survivors if s.qualification == Qualification.EXACT_MATCH]
+        if fv_metadata is not None and audit_downgraded:
+            fv_metadata["excluded_audit_downgrade"] = len(audit_downgraded)
+            fv_metadata["excluded_insufficient_evidence"] = (
+                fv_metadata.get("excluded_insufficient_evidence", 0) + len(audit_downgraded)
+            )
+
     total_scored = len(scored)
     exact_n = sum(1 for s in scored if s.qualification == Qualification.EXACT_MATCH)
     possible_n = sum(1 for s in scored if s.qualification == Qualification.POSSIBLE_MATCH)

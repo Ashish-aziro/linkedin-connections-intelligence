@@ -273,6 +273,51 @@ def test_full_verification_off_falls_back_to_legacy_judge(client, monkeypatch):
     assert "connections" in body
 
 
+# ─────────────────────────── 11 — final-audit downgrade never shows "needs verification" ───────────────────────────
+
+
+def test_final_audit_downgrade_is_excluded_not_shown_as_possible(client, monkeypatch):
+    monkeypatch.setattr(settings, "final_result_audit_enabled", True)
+    ds = _enriched(client)
+    db = SessionLocal()
+    try:
+        keep = _seed(db, ds, name="Audit Keep", desc="Runs AWS and Kubernetes cloud infrastructure daily.")
+        drop = _seed(db, ds, name="Audit Drop", desc="Cloud platform engineer, AWS and Terraform.")
+        db.commit()
+    finally:
+        db.close()
+    monkeypatch.setattr("app.services.full_verification._call_judge", _fake_call())  # everyone verifies TRUE
+
+    from app.services import final_auditor
+
+    def fake_audit(payload, packets, first_pass_by_id, parsed=None):  # noqa: ARG001
+        people = []
+        for p in packets:
+            decision = "downgrade" if p["person_id"] == drop else "approved"
+            people.append({
+                "person_id": p["person_id"], "decision": decision, "confidence": 0.6,
+                "reason": "x", "criteria": [
+                    {"criterion_id": c["id"],
+                     "status_review": "uncertain" if decision == "downgrade" else "supported",
+                     "reason": "", "supporting_evidence_refs": [], "contradicting_evidence_refs": []}
+                    for c in payload["criteria"] if c["required"]
+                ],
+                "supporting_evidence_refs": [], "contradicting_evidence_refs": [],
+                "suggested_qualification": None,
+            })
+        return "ok", people, "anthropic:paid", "claude-sonnet-4-6"
+
+    monkeypatch.setattr(final_auditor, "_call_audit", fake_audit)
+    body = client.post("/search", json={"dataset_id": ds, "query": "cloud infrastructure"}).json()
+
+    names = {r["name"] for r in body["connections"]["results"]}
+    assert "Audit Drop" not in names                              # a downgrade -> excluded, not "Possible"
+    assert body["connections"]["possible_match_count"] == 0
+    for r in body["connections"]["results"]:
+        assert r["qualification"] == "exact_match"
+        assert not r["uncertain_criteria"]                        # no "needs verification: downgraded by the final audit"
+
+
 # ─────────────────────────── helper ───────────────────────────
 
 
