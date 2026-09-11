@@ -408,15 +408,19 @@ def _expand_compact(cv, valid_ids: set[str]) -> dict:
 
 def _call_judge(
     payload: dict, packets: list[dict], unresolved_by_person: dict[str, list[str]] | None = None,
-    *, _retry: bool = False,
+    *, _retry: bool = False, max_tokens_override: int | None = None,
 ) -> tuple[str, object, str | None, str | None]:
     """One batched judge request through the router — the ``CallFn`` the
     adaptive splitter drives. Returns ``("ok", {person_id: {criterion_id:
     verdict_dict}}, provider, model)``, ``("truncated", None, None, None)``
     (caller should split and retry the halves), or ``("failed", None, None,
-    None)`` (every provider genuinely exhausted / non-truncation error)."""
+    None)`` (every provider genuinely exhausted / non-truncation error).
+    ``max_tokens_override`` — full verification asks for ALL criteria on a
+    full-profile packet, whose output is much larger than the legacy
+    unresolved-only estimate; it passes a generous budget to avoid a
+    truncate/split storm."""
     counts = [len(pkt.get("unresolved_criteria") or []) or 1 for pkt in packets]
-    max_tokens = estimate_judge_output_tokens(len(packets), counts)
+    max_tokens = max_tokens_override or estimate_judge_output_tokens(len(packets), counts)
     if _retry:
         from app.services.llm.token_estimate import MAX_OUTPUT_TOKENS
         max_tokens = min(MAX_OUTPUT_TOKENS, max_tokens * 2)

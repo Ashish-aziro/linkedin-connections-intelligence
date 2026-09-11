@@ -55,7 +55,7 @@ def _fake_call(*, statuses=None, omit=(), fail_first_n=0, truncate_multi=False, 
     state = {"n": 0}
     statuses = statuses or {}
 
-    def fake(payload, packets, review_by_person=None):  # noqa: ARG001
+    def fake(payload, packets, review_by_person=None, **_):  # noqa: ARG001
         state["n"] += 1
         if capture is not None:
             capture.append([p["person_id"] for p in packets])
@@ -127,7 +127,7 @@ def test_candidate_omitted_by_a_batch_is_recovered(client, monkeypatch):
     victim = sorted(_viable_ids(client, ds))[0]
     good = _fake_call()
 
-    def wrapper(payload, packets, review_by_person=None):
+    def wrapper(payload, packets, review_by_person=None, **_):
         # the victim is omitted from every MULTI-person batch; the bounded
         # single-person retry (one packet) includes them.
         if len(packets) > 1:

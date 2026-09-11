@@ -34,7 +34,7 @@ from app.schemas import CompactJudgeBatch, ParsedSearchQuery
 from app.services.judge_packet import build_packets, plan_payload
 from app.services.llm.adaptive_batch import run_adaptive
 from app.services.llm.router import generate_structured
-from app.services.llm.token_estimate import estimate_judge_output_tokens
+from app.services.llm.token_estimate import MAX_OUTPUT_TOKENS, estimate_judge_output_tokens
 from app.services.semantic_judge import (
     _call_judge,
     _expand_compact,
@@ -170,8 +170,13 @@ def run_full_verification(
             if m not in meta["models"]:
                 meta["models"].append(m)
 
+    # full-profile packet + ALL criteria => a much larger reply than the legacy
+    # "unresolved only" estimate; ask for the ceiling so a batch rarely truncates.
+    _big = min(MAX_OUTPUT_TOKENS, max(1600, 220 * len(all_ids) + 900))
+
     def _call(pkts):
-        return _call_judge(payload, pkts, review_by_person)
+        return _call_judge(payload, pkts, review_by_person,
+                           max_tokens_override=min(MAX_OUTPUT_TOKENS, _big * max(1, len(pkts))))
 
     # ── 1. batched pass ────────────────────────────────────────────────
     normal = [pkt for pkt in packets if not pkt.get("_packet_too_large")]

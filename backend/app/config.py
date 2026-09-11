@@ -114,8 +114,12 @@ class Settings(BaseSettings):
     #: aggregate — instead of leaving them unverified.
     full_verification_chunk_oversized: bool = True
     #: larger per-packet budget for the full-profile verification packet.
-    full_verification_max_packet_chars: int = 14000
-    full_verification_batch_size: int = 6
+    full_verification_max_packet_chars: int = 12000
+    #: candidates per Sonnet request. Small — a full-profile packet reviewed
+    #: against every criterion is a large reply, so a big batch truncates and
+    #: has to be split repeatedly (slower + more calls). 3 keeps most batches
+    #: in one call.
+    full_verification_batch_size: int = 3
 
     # ── Search quality v2 ────────────────────────────────────
     relevance_weight: float = 20.0         # points reserved for whole-profile relevance
