@@ -10,49 +10,27 @@ import { Badge, Card } from "../components/ui";
 type JudgeMeta = NonNullable<SearchResponse["judge_metadata"]>;
 type AuditMeta = NonNullable<SearchResponse["audit_metadata"]>;
 
-const DEGRADED = new Set(["partial", "unavailable"]);
-
-function InterpretationPanel({ res }: { res: SearchResponse }) {
-  const iq = res.interpreted_query ?? {};
-  const summary = iq.interpretation_summary;
-  const confidence = iq.interpretation_confidence;
-  const tpc = iq.target_person_context ?? {};
-  const goal = tpc.goal || [tpc.current_role, tpc.field].filter(Boolean).join(" → ");
-  const unresolved = iq.unresolved ?? [];
-
-  if (!summary && confidence == null && !goal && unresolved.length === 0) return null;
-
-  return (
-    <Card className="mt-4 px-5 py-4">
-      <div className="flex items-baseline justify-between">
-        <div className="text-xs font-semibold uppercase tracking-wide text-ink-faint">
-          How we interpreted your search
-        </div>
-        {typeof confidence === "number" && (
-          <span className="font-mono text-xs text-ink-faint">{Math.round(confidence * 100)}% confidence</span>
-        )}
-      </div>
-      {summary && <p className="mt-1.5 text-sm text-ink">{summary}</p>}
-      <div className="mt-2 flex flex-wrap gap-2">
-        {iq.intent && <Badge>Goal: {iq.intent.replace(/_/g, " ")}</Badge>}
-        {goal && <Badge tone="accent">{goal}</Badge>}
-      </div>
-      {unresolved.length > 0 && (
-        <div className="mt-2 flex items-start gap-1.5 text-xs text-amber-700">
-          <AlertTriangle size={13} className="mt-0.5 shrink-0" />
-          <span>Some context could not be resolved: {unresolved.join(", ")}</span>
-        </div>
-      )}
-    </Card>
-  );
-}
+// Two separate status vocabularies land in the same `judge.status` field
+// depending on `judge.mode` (see api/types.ts): the legacy semantic judge
+// uses "full" / "partial" / "unavailable" / "not_used"; FULL SONNET
+// VERIFICATION (`mode: "full_verification"`, the current default pipeline)
+// uses "complete" / "incomplete" / "not_used" instead. A search that fully
+// completes full verification reports status "complete" — this used to fall
+// through to the catch-all below and render as "Not used", which is the
+// opposite of what happened (a completed review shown as if it never ran).
+const DEGRADED = new Set(["partial", "unavailable", "incomplete"]);
 
 function verificationLabel(status?: string): string {
-  if (!status) return "Unavailable";
+  if (!status || status === "not_used") return "Not used";
   if (status === "full") return "Full";
   if (status === "partial") return "Partial";
   if (status === "unavailable") return "Unavailable";
-  return "Not used";
+  if (status === "complete") return "Complete";
+  if (status === "incomplete") return "Incomplete";
+  // An unrecognized value must never be silently reported as any specific
+  // status (neither "complete" nor "Not used") — show it verbatim instead of
+  // guessing, so a future backend status value fails loudly, not silently.
+  return `Unknown (${status})`;
 }
 
 function SearchQualityDetails({
@@ -64,6 +42,8 @@ function SearchQualityDetails({
 }) {
   const [open, setOpen] = useState(false);
   if (!judge && !audit) return null;
+
+  const judgeTitle = judge?.mode === "full_verification" ? "Full verification" : "Semantic review";
 
   return (
     <section className="mt-8">
@@ -77,12 +57,31 @@ function SearchQualityDetails({
         <div className="mt-3 grid gap-2 text-sm sm:grid-cols-2">
           {judge && (
             <Card className="px-4 py-3">
-              <div className="text-xs font-semibold text-ink-faint">Semantic review</div>
+              <div className="text-xs font-semibold text-ink-faint">{judgeTitle}</div>
               <div className="mt-1">{verificationLabel(judge.status)}</div>
               <dl className="mt-2 space-y-0.5 text-xs text-ink-soft">
-                <div>Candidates reviewed: {judge.judge_candidate_count}</div>
-                <div>Batches: {judge.judge_successful_batches}/{judge.judge_batch_count} ok</div>
-                {judge.judge_failed_batches > 0 && <div>Failed batches: {judge.judge_failed_batches}</div>}
+                {judge.mode === "full_verification" ? (
+                  // TASK 6 — distinguish how many candidates were verified from
+                  // how much of that was a fresh Sonnet call vs. an already-
+                  // validated cached verdict reused from an earlier search
+                  // (never stale/invalid — a cache hit is invalidated
+                  // automatically the moment a candidate's evidence changes).
+                  // "0/0 ok" batches used to read as if nothing ran at all.
+                  <>
+                    <div>
+                      Candidates verified: {judge.sonnet_verified_candidate_count ?? judge.judge_candidate_count}
+                    </div>
+                    <div>Reused cached verdicts: {judge.cache_hits ?? 0}</div>
+                    <div>New verification calls: {judge.total_llm_calls ?? judge.judge_batch_count}</div>
+                    {judge.judge_failed_batches > 0 && <div>Failed batches: {judge.judge_failed_batches}</div>}
+                  </>
+                ) : (
+                  <>
+                    <div>Candidates reviewed: {judge.judge_candidate_count}</div>
+                    <div>Batches: {judge.judge_successful_batches}/{judge.judge_batch_count} ok</div>
+                    {judge.judge_failed_batches > 0 && <div>Failed batches: {judge.judge_failed_batches}</div>}
+                  </>
+                )}
                 {judge.omitted_criteria > 0 && <div>Missing required reviews: {judge.omitted_criteria}</div>}
               </dl>
             </Card>
@@ -147,27 +146,6 @@ export default function ResultsPage() {
 
       <h1 className="mt-3 text-xl font-semibold">&ldquo;{res.query}&rdquo;</h1>
 
-      <InterpretationPanel res={res} />
-
-      {res.interpreted_query?.criteria?.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-2">
-          {res.interpreted_query.criteria.map((c) => {
-            const label =
-              c.concept ||
-              (c.values && c.values.length > 1
-                ? c.values.join(c.operator === "ALL_OF" ? " AND " : " or ")
-                : c.value);
-            return (
-              <Badge key={c.id} tone={c.required ? "accent" : "default"}>
-                {c.operator === "NOT" ? "NOT " : ""}
-                {label} · {c.weight.toFixed(0)}
-                {c.required ? " · required" : ""}
-              </Badge>
-            );
-          })}
-        </div>
-      )}
-
       {verificationDegraded && (
         <div className="mt-4 flex items-start gap-2 rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 ring-1 ring-amber-200">
           <AlertTriangle size={15} className="mt-0.5 shrink-0" />
@@ -211,7 +189,8 @@ export default function ResultsPage() {
         <section className="mt-8">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-ink-faint">Near matches</h2>
           <p className="mt-1 text-xs text-ink-faint">
-            These people were relevant but failed one required condition.
+            Related people from your connections who don&rsquo;t fully match every requirement but may
+            still be worth considering.
           </p>
           <div className="mt-4 space-y-3">
             {nearMatches.map((item) => (

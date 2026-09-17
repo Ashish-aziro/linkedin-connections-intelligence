@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from app.constants import CriterionType, Operator, Scope
+from app.constants import CriterionType, KNOWN_TECH_AND_DOMAIN_TERMS, Operator, Scope
 from app.schemas import ParsedSearchQuery, SearchCriterion
 
 # ─────────────────────────── context (V4 §14) ───────────────────────────
@@ -113,6 +113,11 @@ _LOC_OR_CI_RE = re.compile(_LOC_OR_RE.pattern, re.I)
 #: common objects of "in <X>" that are professions / domains / states-of-being,
 #: NOT geographic places. Generic (not query-specific, not a city list) — it lets
 #: "in atlanta" resolve to a location while "in leadership" / "in sales" do not.
+#: Also includes the shared technology/skill/academic-domain reference set
+#: (KNOWN_TECH_AND_DOMAIN_TERMS) so "experience in Python" / "experts in
+#: Kubernetes" / "faculty in Computational Biology" are never mistaken for a
+#: LOCATION criterion — bare capitalization after "in"/"near"/"from" is not
+#: proof of a place (review finding D1).
 _NOT_A_PLACE = frozenset({
     "leadership", "management", "sales", "marketing", "research", "operations",
     "finance", "accounting", "design", "product", "engineering", "security",
@@ -121,7 +126,7 @@ _NOT_A_PLACE = frozenset({
     "fintech", "tech", "big tech", "faang", "startup", "startups", "enterprise",
     "software", "hardware", "data", "analytics", "devops", "infrastructure",
     "the industry", "the field", "the space", "the sector", "my field", "my network",
-})
+}) | KNOWN_TECH_AND_DOMAIN_TERMS
 
 
 def _casing_uninformative(query: str) -> bool:
@@ -216,7 +221,9 @@ def extract_facts(query: str, *, context: dict[str, str] | None = None) -> FactS
     loc_m = _LOC_OR_RE.search(q)
     places: list[str] = []
     if loc_m:
-        places = _split_or(loc_m.group(1))
+        candidates = _split_or(loc_m.group(1))
+        if candidates and all(_looks_like_place(c) for c in candidates):
+            places = candidates
     else:
         region_m = _REGION_IN_RE.search(q)
         if region_m:
@@ -244,7 +251,8 @@ def extract_facts(query: str, *, context: dict[str, str] | None = None) -> FactS
     if places:
         fs.criteria.append(SearchCriterion(
             id="loc", type=CriterionType.LOCATION, values=places,
-            operator=Operator.ANY_OF, weight=30, required=True,
+            operator=Operator.ANY_OF, weight=30, required=location_required(query),
+            geo_strict=location_geo_strict(query),
         ))
         fs.consumed.update(p.lower() for p in places)
 
@@ -407,12 +415,65 @@ def _looks_like_company(s: str) -> bool:
         and s.strip().lower() not in _NOT_A_COMPANY
 
 
+#: hedging language that turns a mentioned location into a preference rather
+#: than a hard filter (review finding D2 — "AI engineers in Atlanta,
+#: preferably" must NOT become a required location). Scanned over the whole
+#: query rather than tied to the exact location span: these phrases only ever
+#: describe a location preference in a candidate-search query, so a whole-query
+#: match carries no false-positive risk for other criteria types. The absence
+#: of any of these phrases keeps the pre-existing default (mentioned == required),
+#: which "strictly in Atlanta" / "must be in Atlanta" / a bare "in Atlanta"
+#: still hit unchanged.
+_LOCATION_PREFERENCE_RE = re.compile(
+    r"\b(preferably|ideally|if possible|nice to have|a plus|a bonus|not required|"
+    r"not a requirement|not necessary|not mandatory|optional(?:ly)?|open to remote|"
+    r"remote[- ](?:ok|okay|friendly|welcome)|willing to relocate|flexible on location|"
+    r"no location requirement|doesn't matter|does not matter)\b",
+    re.I,
+)
+
+
+def location_required(query: str) -> bool:
+    """Whether an explicit location mention in ``query`` should be a hard
+    requirement (the default) or a preference — decided from hedging language
+    only, never from the location text itself. Shared by the deterministic
+    fact layer and the deterministic parser's own location criterion so both
+    apply the identical rule (review finding D2)."""
+    return not _LOCATION_PREFERENCE_RE.search(query)
+
+
+#: unambiguous literal phrasing that forbids a nearby-city substitute for the
+#: named location — "strictly/only/exclusively in X" or an explicit "not
+#: nearby cities/suburbs" — as opposed to an ordinary "in X" mention, which
+#: still allows a labeled nearby-city Near Match (review finding F3: a query
+#: had no way to say this at all, so a strict location was relaxed exactly
+#: like an ordinary one).
+_LOCATION_STRICT_RE = re.compile(
+    r"\b(?:strictly|only|exclusively)\s+(?:in|near|around|based in|located in)\b"
+    r"|\bin\s+[\w .,-]+?\s+only\b"
+    r"|\b(?:not|no)\s+nearby\s+(?:cit(?:y|ies)|suburbs?|areas?|substitutes?)\b",
+    re.I,
+)
+
+
+def location_geo_strict(query: str) -> bool:
+    """Whether an explicit location mention in ``query`` forbids nearby-city
+    substitution, as opposed to an ordinary required location (which may
+    still surface a nearby-city candidate as a labeled Near Match). Detected
+    from unambiguous literal phrasing only, never inferred from the place
+    name itself."""
+    return bool(_LOCATION_STRICT_RE.search(query))
+
+
 def _looks_like_place(s: str) -> bool:
-    if s.lower() in _REGION_WORDS:
+    sl = s.lower()
+    if sl in _NOT_A_PLACE or sl in _NOT_A_COMPANY:
+        return False
+    if any(tok in _NOT_A_PLACE for tok in sl.split()):
+        return False
+    if sl in _REGION_WORDS:
         return True
-    if re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?(?:,\s*[A-Z][a-z]+| [A-Z]{2})?$", s):
-        return s.lower() not in _NOT_A_COMPANY
-    return False
+    return bool(re.match(r"^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?(?:,\s*[A-Z][a-z]+| [A-Z]{2})?$", s))
 
 
 # ─────────────────────────── merge + repair (V4 §15/§17) ───────────────────────────
@@ -481,13 +542,35 @@ def merge_into_plan(plan: ParsedSearchQuery, facts: FactSet, *, context: dict[st
     crits = kept
 
     for f in facts.criteria:
-        match = next((c for c in crits if _same_fact(c, f)), None)
+        if f.type == CriterionType.LOCATION and f.operator != Operator.NOT:
+            # A query has one "where" dimension. The deterministic regex layer
+            # only ever sees the raw phrase ("southeast us"), while the LLM may
+            # legitimately expand a region into member states/cities that share
+            # no literal text with it ("southeast us" -> Georgia, Florida, ...).
+            # Matching by VALUE overlap (as _same_fact does) would then treat
+            # the LLM's correct expansion as "not the same fact" and bolt on a
+            # second required LOCATION criterion with only the unexpanded raw
+            # phrase as its value — which no real profile ever literally
+            # contains, so the hard gate rejects every candidate outright. Match
+            # by type alone here so an LLM-expanded location is recognised as
+            # already covering the explicit fact instead of being duplicated.
+            match = next((c for c in crits if c.type == CriterionType.LOCATION
+                          and c.operator != Operator.NOT), None)
+        else:
+            match = next((c for c in crits if _same_fact(c, f)), None)
         if match is None:
             issues.append(f"re-added explicit {f.type} {sorted(_values_of(f))} the plan omitted")
             crits.append(f)
             continue
-        # union any explicit values the plan missed ("Google or Meta" -> both)
-        missing = _values_of(f) - _values_of(match)
+        # union any explicit values the plan missed ("Google or Meta" -> both) —
+        # but not the raw unexpanded region phrase into an ALREADY-expanded
+        # multi-value location (adds nothing: it can never literally appear on
+        # a profile, it would only make the interpretation tag noisier).
+        already_expanded_region = (
+            f.type == CriterionType.LOCATION and len(_values_of(match)) > 1
+            and not _same_fact(match, f)
+        )
+        missing = set() if already_expanded_region else _values_of(f) - _values_of(match)
         if missing:
             have = match.values or ([match.value] if match.value else [])
             add = [v for v in (f.values or [f.value]) if v.lower() in missing]
@@ -506,9 +589,22 @@ def merge_into_plan(plan: ParsedSearchQuery, facts: FactSet, *, context: dict[st
         if f.operator == Operator.NOT and match.operator != Operator.NOT:
             issues.append(f"restored NOT for {sorted(_values_of(match))}")
             match.operator = Operator.NOT
-        if f.required and not match.required:
+        # LOCATION is excluded here (review finding D2): mandatory-vs-preferred
+        # for a location is Anthropic's call (or, with no LLM at all, the
+        # hedge-aware ``location_required()`` value already on the fact) — this
+        # deterministic layer must never one-directionally force a location the
+        # LLM correctly read as a preference back into a hard requirement.
+        # Every other fact type (company / transition / years) keeps the prior
+        # behaviour: an explicit fact the query stated plainly is required.
+        if f.required and not match.required and f.type != CriterionType.LOCATION:
             issues.append(f"made {sorted(_values_of(match))} required (explicit in the query)")
             match.required = True
+        # geo_strict only ever turns ON from an unambiguous literal phrase
+        # ("strictly"/"only"/"exclusively") — never off, and never inferred by
+        # this layer from the place name itself (review finding F3).
+        if f.type == CriterionType.LOCATION and f.geo_strict and not match.geo_strict:
+            issues.append(f"marked {sorted(_values_of(match))} geo_strict (explicit 'strictly/only' wording)")
+            match.geo_strict = True
 
     plan.criteria = crits
     plan.context = {**plan.context, **context}

@@ -33,6 +33,7 @@ from app.schemas import _CRITERION_TYPE_ALIASES, LenientSearchPlan
 _PASS_THROUGH_KEYS = (
     "intent", "context", "target_person_context", "unresolved",
     "interpretation_summary", "interpretation_confidence",
+    "primary_intent", "intent_anchor_criterion_ids",
 )
 
 
@@ -148,6 +149,7 @@ def repair_plan(lenient: LenientSearchPlan) -> tuple[dict, list[str]]:
             "scope": c.get("scope") if isinstance(c.get("scope"), str) else None,
             "concept": concept,
             "modality": _as_str(c.get("modality")) or "certain",
+            "geo_strict": bool(c["geo_strict"]) if c.get("geo_strict") is not None else False,
         })
 
     # a missing / unparseable weight becomes the average of the explicit ones

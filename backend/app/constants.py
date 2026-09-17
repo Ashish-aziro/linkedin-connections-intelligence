@@ -351,3 +351,78 @@ class CompanyClassProvenance:
 class LLMProviderName:
     ANTHROPIC = "anthropic:paid"
     NONE = "none"
+
+
+class GeoRelation:
+    """Generic near-location relationship between a candidate's location and a
+    query's wanted location value(s) — used ONLY for Near Match ranking /
+    explanation, never to turn a non-exact location into an Exact match.
+
+    Deterministic structured fields (city/state/country) and the existing metro
+    alias map are preferred; an LLM may fill in ``NEARBY_CITY`` / ``SAME_METRO``
+    for a pair it recognises, but returns ``UNKNOWN`` rather than guessing.
+    """
+
+    SAME_METRO = "same_metro"
+    NEARBY_CITY = "nearby_city"
+    SAME_REGION = "same_region"
+    SAME_STATE_NOT_NEAR = "same_state_but_not_near"
+    FAR = "far"
+    UNKNOWN = "unknown"
+
+
+ALL_GEO_RELATIONS = {
+    v for k, v in vars(GeoRelation).items() if not k.startswith("_") and isinstance(v, str)
+}
+
+
+class NearMatchRelation:
+    """Generic categories for WHY a candidate is a useful Near Match (V4 near-
+    match design PART 8). Never query-specific — a fixed, small vocabulary the
+    near-match judge picks from."""
+
+    GEOGRAPHIC_ADJACENT = "geographic_adjacent"
+    ROLE_ADJACENT = "role_adjacent"
+    INDUSTRY_ADJACENT = "industry_adjacent"
+    EXPERIENCE_ADJACENT = "experience_adjacent"
+    SENIORITY_ADJACENT = "seniority_adjacent"
+    COMPANY_CATEGORY_ADJACENT = "company_category_adjacent"
+    PARTIAL_REQUIREMENT_MATCH = "partial_requirement_match"
+    OTHER_RELEVANT = "other_relevant"
+    NOT_MEANINGFUL = "not_meaningful"
+
+
+ALL_NEAR_MATCH_RELATIONS = {
+    v for k, v in vars(NearMatchRelation).items() if not k.startswith("_") and isinstance(v, str)
+}
+#: relation types reliable enough to surface as a small UI label (PART 12) —
+#: NOT_MEANINGFUL is a rejection, not a label; a validator downgrade to
+#: "other_relevant" is real but too vague to label.
+_RELIABLE_NEAR_RELATIONS = ALL_NEAR_MATCH_RELATIONS - {
+    NearMatchRelation.OTHER_RELEVANT, NearMatchRelation.NOT_MEANINGFUL,
+}
+
+
+#: fixed, non-query-specific reference set of technology/skill/academic-domain
+#: words that are capitalized-proper-noun-shaped in ordinary English ("Python",
+#: "Kubernetes", "Computational Biology") but are never a geographic place or a
+#: company name. Shared by the deterministic query-fact extractor (so "in
+#: Python" is never mistaken for a location) and the deterministic query
+#: parser's own skill detector — a single list, not two independently
+#: maintained ones.
+KNOWN_TECH_AND_DOMAIN_TERMS = frozenset({
+    "aws", "gcp", "azure", "java", "python", "golang", "go", "rust", "c++", "typescript",
+    "javascript", "react", "node", "node.js", "kubernetes", "docker", "terraform", "kafka",
+    "spark", "sql", "postgresql", "mysql", "redis", "mongodb", "graphql", "distributed systems",
+    "machine learning", "ml", "deep learning", "nlp", "llm", "llms", "pytorch", "tensorflow",
+    "data engineering", "mlops", "devops", "security", "cryptography", "blockchain",
+    "microservices", "system design", "cloud", "cloud infrastructure", "networking",
+    "product management", "design", "ui", "ux", "fintech", "payments", "fraud",
+    "salesforce", "figma", "jira", "github", "gitlab", "jenkins", "ansible", "linux",
+    "excel", "tableau", "power bi", "sap", "oracle", "sharepoint", "slack", "notion",
+    "webpack", "vue", "angular", "swift", "kotlin", "scala", "ruby", "php", "hadoop",
+    "airflow", "snowflake", "databricks",
+    "computational biology", "biology", "chemistry", "physics", "mathematics", "economics",
+    "psychology", "computer science", "data science", "artificial intelligence",
+    "reinforcement learning", "cybersecurity",
+})

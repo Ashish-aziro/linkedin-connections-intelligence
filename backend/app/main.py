@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -18,6 +20,20 @@ log = logging.getLogger("app")
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    # TASK 5 — preload the local ML models now instead of paying their load
+    # cost (sentence-transformers import + weights) inside the FIRST search
+    # after every restart. Both models are independent, so they load in
+    # parallel; each is internally never-raising (see embeddings.preload /
+    # reranker.preload) — a failed preload just means the usual lazy load
+    # happens on first use, startup itself is never blocked by it failing.
+    from app.services import embeddings, reranker
+
+    t0 = time.perf_counter()
+    await asyncio.gather(
+        asyncio.to_thread(embeddings.preload),
+        asyncio.to_thread(reranker.preload),
+    )
+    log.info("model preload done in %.1fs", time.perf_counter() - t0)
     log.info(
         "startup ok — env=%s use_fixtures=%s apify=%s anthropic=%s",
         settings.environment,

@@ -58,10 +58,19 @@ def compute_semantic_similarity(
     ctx: ScoringContext,
     *,
     deadline=None,
+    db=None,
 ) -> None:
     """Populate ``ctx.semantic_similarity`` for every (viable candidate, semantic
     concept) pair, batched by concept. No-op when the reranker is disabled or
-    there are no semantic concepts."""
+    there are no semantic concepts.
+
+    TASK 5 — this is the single biggest measured NON-LLM search cost (a
+    ``CrossEncoder.predict()`` call over every viable candidate, per concept —
+    see the TASK 2 real-data baseline). A candidate's score for a given
+    concept only depends on THEIR OWN career snippet + the concept text, so
+    it is safely reusable across searches (``db`` given, TASK 5) — a cache hit
+    only changes WHEN the score is computed, never what it is or how it is
+    used (still a ranking signal only)."""
     if not settings.reranker_enabled or not facts_list:
         return
     concepts = semantic_concepts(parsed)
@@ -78,9 +87,10 @@ def compute_semantic_similarity(
 
     from app.services.reranker import cross_encode
 
-    ids = list(snippets)
-    texts = [snippets[pid] for pid in ids]
     prof = search_profile.current()
+    cache = None
+    if db is not None:
+        from app.services import semantic_similarity_cache as cache
     for concept in concepts:
         if deadline is not None and deadline.expired():
             log.warning(
@@ -88,9 +98,22 @@ def compute_semantic_similarity(
                 len(concepts) - _done(concepts, concept), len(concepts),
             )
             return
-        scores = cross_encode(concept, texts)  # ONE batched predict for the whole pool
-        for pid, sc in zip(ids, scores):
+
+        cached = cache.lookup(db, concept, snippets, model=settings.reranker_model) if cache else {}
+        for pid, sc in cached.items():
             ctx.semantic_similarity[(pid, concept)] = sc
+        miss_ids = [pid for pid in snippets if pid not in cached]
+        if prof is not None:
+            prof.incr("semantic_similarity_cache_hits", len(cached))
+
+        if miss_ids:
+            miss_texts = [snippets[pid] for pid in miss_ids]
+            scores = cross_encode(concept, miss_texts)  # ONE batched predict for the miss set
+            fresh = dict(zip(miss_ids, scores))
+            for pid, sc in fresh.items():
+                ctx.semantic_similarity[(pid, concept)] = sc
+            if cache:
+                cache.store(db, concept, fresh, snippets, model=settings.reranker_model)
         if prof is not None:
             prof.incr("semantic_similarity_concepts")
 

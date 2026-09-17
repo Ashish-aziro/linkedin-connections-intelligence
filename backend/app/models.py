@@ -345,6 +345,73 @@ class ProfileEmbedding(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class SemanticVerdictCache(Base):
+    """TASK 4 — reusable full-verification / semantic-judge verdicts (V4
+    perf-hardening). A row is only ever written from an ALREADY-VALIDATED
+    verdict (``judge_validator.validate_person`` passed it) — never a raw,
+    incomplete, or unverified LLM response.
+
+    Reuse requires an EXACT match on every column that could change the
+    correct answer: the person, the normalized criterion (+operator/scope/
+    modality), the evidence actually used (``evidence_fingerprint`` — a hash
+    of the exact packet content, so ANY fact change — re-enrichment, edited
+    data — naturally invalidates every cached verdict for that person), the
+    model, the prompt version, the schema version, and the query CONTEXT (a
+    hash of intent/context/target_person_context — two different searches
+    only share a cache entry when the broader question was actually the
+    same). ``UniqueConstraint`` below is the exact reuse key."""
+
+    __tablename__ = "semantic_verdict_cache"
+    __table_args__ = (
+        UniqueConstraint(
+            "person_id", "criterion_key", "evidence_fingerprint",
+            "model", "prompt_version", "schema_version", "context_key",
+            name="uq_verdict_cache_key",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: gen_id("vcache"))
+    person_id: Mapped[str] = mapped_column(ForeignKey("people.id", ondelete="CASCADE"), index=True)
+    criterion_key: Mapped[str] = mapped_column(String, index=True)
+    evidence_fingerprint: Mapped[str] = mapped_column(String)
+    model: Mapped[str] = mapped_column(String)
+    prompt_version: Mapped[int] = mapped_column(Integer)
+    schema_version: Mapped[int] = mapped_column(Integer)
+    #: hash of the query-context fields the verdict's meaning can depend on;
+    #: "" for a criterion whose meaning never depends on broader context.
+    context_key: Mapped[str] = mapped_column(String, default="")
+    verdict_json: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class SemanticSimilarityCache(Base):
+    """TASK 5 — reusable concept-vs-career cross-encoder score (V4
+    perf-hardening). The single biggest measured NON-LLM search cost (~21s of
+    a ~24s warm real-data baseline, see the TASK 2 benchmark) is
+    ``CrossEncoder.predict()`` over every viable candidate for every semantic
+    concept — a RANKING signal only (never proof of irrelevance, never a
+    filter). Its inputs are query-independent per candidate (the career
+    snippet) and stable per concept, so the score itself is safely reusable
+    across searches — reuse changes WHEN the computation happens, never WHAT
+    gets shown, since this table is never consulted for qualification."""
+
+    __tablename__ = "semantic_similarity_cache"
+    __table_args__ = (
+        UniqueConstraint(
+            "person_id", "concept_key", "evidence_fingerprint", "model",
+            name="uq_similarity_cache_key",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: gen_id("simcache"))
+    person_id: Mapped[str] = mapped_column(ForeignKey("people.id", ondelete="CASCADE"), index=True)
+    concept_key: Mapped[str] = mapped_column(String, index=True)
+    evidence_fingerprint: Mapped[str] = mapped_column(String)
+    model: Mapped[str] = mapped_column(String)
+    score: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class EnrichmentJob(Base):
     __tablename__ = "enrichment_jobs"
 

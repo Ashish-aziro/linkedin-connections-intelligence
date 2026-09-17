@@ -24,13 +24,16 @@ import re
 from pydantic import ValidationError
 
 from app.config import settings
-from app.constants import CriterionType, Operator, Scope
+from app.constants import CriterionType, KNOWN_TECH_AND_DOMAIN_TERMS, Operator, Scope
 from app.schemas import LenientSearchPlan, ParsedSearchQuery, SearchCriterion
 from app.services.llm.router import generate_structured
 from app.services.matching import concept_overlap, seniority_rank
 from app.services.query_facts import (
+    _looks_like_place,
     build_summary,
     extract_facts,
+    location_geo_strict,
+    location_required,
     strip_context,
     validate_and_repair,
 )
@@ -39,15 +42,10 @@ from app.services.query_intent import augment_plan
 
 log = logging.getLogger("app.query")
 
-_KNOWN_SKILLS = {
-    "aws", "gcp", "azure", "java", "python", "golang", "go", "rust", "c++", "typescript",
-    "javascript", "react", "node", "node.js", "kubernetes", "docker", "terraform", "kafka",
-    "spark", "sql", "postgresql", "mysql", "redis", "mongodb", "graphql", "distributed systems",
-    "machine learning", "ml", "deep learning", "nlp", "llm", "llms", "pytorch", "tensorflow",
-    "data engineering", "mlops", "devops", "security", "cryptography", "blockchain",
-    "microservices", "system design", "cloud", "cloud infrastructure", "networking",
-    "product management", "design", "ui", "ux", "fintech", "payments", "fraud",
-}
+#: same fixed reference set the deterministic query-fact extractor uses to
+#: keep a skill/tool name from being mistaken for a location (see
+#: ``query_facts._NOT_A_PLACE`` / ``KNOWN_TECH_AND_DOMAIN_TERMS`` docstring).
+_KNOWN_SKILLS = KNOWN_TECH_AND_DOMAIN_TERMS
 
 _SYSTEM = (
     "You convert a recruiter/networking search into a structured search plan. Output JSON only.\n\n"
@@ -115,6 +113,25 @@ _SYSTEM = (
     "the SUBJECT of the query is always required. 'CXOs in Nashville' -> seniority(CXO) AND "
     "location(Nashville) BOTH required. 'former Amazon employees' -> past_company(Amazon) required. "
     "'software engineers at fintech companies' -> role and fintech-employer both required.\n\n"
+    "GEOGRAPHIC INTENT is yours alone to decide - no other part of this system infers it. Extract "
+    "location EXACTLY as the query states it, decide required vs preferred from the query's own "
+    "wording, and leave `location` out entirely when no place is mentioned - never default a "
+    "location in, never infer one from context. 'AI engineers in Atlanta' -> location(Atlanta) "
+    "required=true (a bare 'in <place>' is a filter by default, same as the general requiredness "
+    "rule above). 'AI engineers in Atlanta, preferably' / 'ideally based in Atlanta' / 'open to "
+    "remote' -> location(Atlanta) required=FALSE - hedging language makes it a preference, not a "
+    "filter, even though the place is still worth naming. 'AI engineers strictly in Atlanta' / "
+    "'must be in Atlanta' -> required=true AND geo_strict=true (see below). 'AI engineers in Atlanta or nearby cities' -> "
+    "location(Atlanta) required=true, but the query itself has explicitly permitted geographic "
+    "expansion (record this in `interpretation_summary` too, for readability). 'AI engineers' (no "
+    "place named) -> do not add a location criterion at all - a query with no geographic mention must "
+    "never be scored, filtered, or near-matched on location.\n\n"
+    "  - `geo_strict` (bool, location criteria only, default false): true ONLY when the query "
+    "explicitly forbids a nearby-city substitute for the named location ('strictly in Atlanta', 'only "
+    "in Austin, not nearby suburbs', 'exclusively based in Denver'). An ordinary required location "
+    "('AI engineers in Atlanta') is required=true, geo_strict=false - it may still surface a "
+    "nearby-city candidate as a labeled Near Match. geo_strict=true means a nearby-city candidate must "
+    "never be shown as satisfying this requirement, not even as a Near Match.\n\n"
     "CONTEXT vs CANDIDATE REQUIREMENT: words describing the EVENT or PURPOSE are not candidate "
     "criteria. 'people to invite to a networking event' -> networking is context, NOT skill=networking. "
     "'speak at an AI conference' -> AI expertise may be a criterion, 'conference' is context. Put "
@@ -152,11 +169,38 @@ _SYSTEM = (
     "university DEGREE (education), and PUBLICATIONS (publication). Studying at a "
     "university is NOT working in academia; one paper is NOT a professor. "
     "'professors in AI' -> faculty-appointment (required) + research/teaching "
-    "focus on AI (required), NOT education=AI."
+    "focus on AI (required), NOT education=AI.\n\n"
+    "PRIMARY INTENT (internal only — never shown to the user, used only to rank a "
+    "separate 'near match' recommendation layer): set `primary_intent` to ONE short "
+    "phrase naming the query's actual professional PURPOSE, and "
+    "`intent_anchor_criterion_ids` to the id(s) (from `criteria` you just produced) "
+    "that represent that purpose — as distinct from a CONSTRAINT the query also "
+    "names (a location, a named company, a school, a certification, a language). "
+    "'VCs in Atlanta' -> primary_intent: 'venture capital / investing', anchor: the "
+    "investor criterion's id (location is the constraint, not the anchor). 'AI "
+    "engineers in New York' -> primary_intent: 'AI / ML engineering', anchor: the "
+    "engineering-role criterion's id. 'Former Amazon engineers now at startups' -> "
+    "primary_intent describes the professional/career target (e.g. 'experienced "
+    "software engineer'); Amazon and startup-employer stay constraints, not "
+    "anchors, unless the query is fundamentally ABOUT that transition itself. "
+    "`intent_anchor_criterion_ids` MUST be actual ids from `criteria` above — never "
+    "invent one. If every required criterion IS itself the constraint (e.g. 'people "
+    "in Austin' has nothing else), anchor on that criterion's own id. Omit both "
+    "fields entirely if you are not confident — an internal fallback derives them "
+    "deterministically when absent; a wrong guess is worse than none."
 )
 
 
-_MODAL_RE = re.compile(r"\b(must|only|required|has to|need to have|exclusively)\b", re.I)
+_MODAL_RE = re.compile(
+    r"\b(must|only|required|has to|need to have|exclusively"
+    # bug report PART 4/5 — "whose job title IS X" / "titled X" / "with the
+    # title X" is a genuine, explicit TITLE constraint by wording alone, even
+    # without an imperative word like "must"/"only". Generic phrase patterns,
+    # not any specific title/profession — matches "title is/was/of", "titled",
+    # "with the title of" regardless of what follows.
+    r"|titled|title\s+(?:is|was|of)|with\s+the\s+title)\b",
+    re.I,
+)
 #: types the model tends to over-require; soften unless the query uses modal language.
 #: Semantic/company-category/location/company/education criteria are NOT auto-softened -
 #: whether they are hard filters is a real per-query judgment, not a blanket rule
@@ -452,15 +496,20 @@ def _deterministic_parse(query: str) -> ParsedSearchQuery:
     crits: list[SearchCriterion] = []
     used_spans: list[str] = []
 
-    # locations FIRST, with OR support — this was silently dropped before (spec §11/§13)
+    # locations FIRST, with OR support — this was silently dropped before (spec §11/§13).
+    # Every candidate must plausibly be a place (review finding D1) — this
+    # regex is capitalization-shape-only and would otherwise treat "in
+    # Salesforce, Docker" the same as "in Memphis, Nashville".
     loc_m = _LOCATION_OR_RE.search(q)
     if loc_m:
-        places = _split_or_list(loc_m.group(1))
+        candidates = _split_or_list(loc_m.group(1))
+        places = candidates if candidates and all(_looks_like_place(c) for c in candidates) else []
         if places:
             crits.append(
                 SearchCriterion(
                     id="location", type=CriterionType.LOCATION, values=places,
-                    operator=Operator.ANY_OF, weight=35, required=True,
+                    operator=Operator.ANY_OF, weight=35, required=location_required(query),
+                    geo_strict=location_geo_strict(query),
                 )
             )
             used_spans.extend(p.lower() for p in places)

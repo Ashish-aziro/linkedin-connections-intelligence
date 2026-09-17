@@ -2,7 +2,7 @@ import { useState } from "react";
 import { ChevronDown, ExternalLink, ShieldCheck } from "lucide-react";
 import type { SearchResultItem } from "../api/types";
 import { evidenceProvenance } from "../api/types";
-import { initials } from "../lib/format";
+import { formatPercent, initials } from "../lib/format";
 import { Badge, ScoreMeter } from "./ui";
 
 const PROVENANCE_LABEL: Record<string, string> = {
@@ -16,6 +16,19 @@ const PROVENANCE_TONE: Record<string, "fact" | "inferred"> = {
   ai_inferred: "inferred",
   company_inference: "inferred",
   relevance: "inferred",
+};
+
+// Near Match relation labels — a short, user-facing chip shown ONLY for a
+// relation type the backend validator considered reliable enough to surface
+// (an ungrounded / vague verdict never reaches the frontend with a label).
+const NEAR_RELATION_LABEL: Record<string, string> = {
+  geographic_adjacent: "Nearby location",
+  role_adjacent: "Related role",
+  industry_adjacent: "Related industry",
+  experience_adjacent: "Related experience",
+  seniority_adjacent: "Adjacent seniority",
+  company_category_adjacent: "Related company type",
+  partial_requirement_match: "Partial match",
 };
 
 export function QualificationBadge({ item }: { item: SearchResultItem }) {
@@ -63,6 +76,9 @@ export function ResultCard({
             <span className="truncate font-semibold">{item.name ?? "Unknown"}</span>
             {item.is_connection && <Badge tone="accent">Connection</Badge>}
             <QualificationBadge item={item} />
+            {isNear && item.near_relation_type && NEAR_RELATION_LABEL[item.near_relation_type] && (
+              <Badge tone="inferred">{NEAR_RELATION_LABEL[item.near_relation_type]}</Badge>
+            )}
             {!isNear && item.llm_verified && (
               <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700 ring-1 ring-emerald-200">
                 <ShieldCheck size={12} /> Final audit verified
@@ -166,13 +182,13 @@ export function ResultCard({
                         {c.required && <span className="ml-1 text-accent">•req</span>}
                       </td>
                       <td className="py-1.5 text-right text-ink-faint">
-                        {c.score.toFixed(0)}/{c.weight.toFixed(0)}
+                        {c.score.toFixed(0)}/{c.weight.toFixed(0)} ({formatPercent(c.score, c.weight)}%)
                       </td>
                     </tr>
                   ))}
                   <tr>
                     <td className="pt-2 font-semibold">TOTAL</td>
-                    <td className="pt-2 text-right font-semibold">{item.match_score.toFixed(0)}/100</td>
+                    <td className="pt-2 text-right font-semibold">{formatPercent(item.match_score)}%</td>
                   </tr>
                 </tbody>
               </table>

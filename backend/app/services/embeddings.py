@@ -39,11 +39,29 @@ def _get_model():
     if _model is None:
         with _lock:
             if _model is None:
+                import time as _time
+
                 from sentence_transformers import SentenceTransformer
 
                 log.info("loading embedding model %s", settings.embedding_model)
+                t0 = _time.perf_counter()
                 _model = SentenceTransformer(settings.embedding_model)
+                log.info("embedding model loaded in %.1fs", _time.perf_counter() - t0)
     return _model
+
+
+def preload() -> None:
+    """TASK 5 — load the embedding model now (app startup) instead of paying
+    the load cost inside the first search after a restart. A no-op once
+    already loaded (``_get_model``'s double-checked lock). Never raises —
+    startup must not fail because an optional local model couldn't load; the
+    lazy path in ``embed_text``/``embed_texts`` remains the fallback."""
+    if not settings.embeddings_enabled:
+        return
+    try:
+        _get_model()
+    except Exception:  # noqa: BLE001
+        log.exception("embedding model preload failed — will retry lazily on first use")
 
 
 def embed_text(text: str) -> bytes:

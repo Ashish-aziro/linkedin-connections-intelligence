@@ -31,6 +31,7 @@ from app.constants import AuditDecision, AuditStatus
 from app.schemas import CompactAuditBatch, ParsedSearchQuery
 from app.services.judge_packet import build_packets
 from app.services.llm.adaptive_batch import run_adaptive
+from app.services.llm.concurrency import run_concurrent_map
 from app.services.llm.router import generate_structured
 from app.services.llm.token_estimate import estimate_audit_output_tokens, plan_batch_size
 from app.services.semantic_judge import _make_batches
@@ -185,13 +186,26 @@ def run_final_audit(
         log.warning("audit: %d packet(s) too large — left unaudited: %s", len(oversized), oversized[:10])
 
     decisions: dict[str, dict] = {}
+    # TASK 8 (perf hardening) — independent batches, same bounded concurrency
+    # as full_verification/near_match_judge (SEMANTIC_JUDGE_CONCURRENCY; 1 =
+    # sequential). The deadline decision stays SEQUENTIAL and up front (same
+    # call sequence / same "stop scheduling further batches" semantics as the
+    # original loop) — only the actual network calls for the batches that
+    # passed that check run concurrently. A batch skipped this way is left
+    # unaudited, exactly as before (falls back to UNKNOWN, never guessed).
+    runnable_batches = []
     for batch in batches:
         if deadline is not None and deadline.expired():
             meta.deadline_reached = True
             log.warning("audit: search deadline reached — remaining batches skipped, "
                        "their candidates fall back to UNKNOWN")
             break
-        leaves, stats = run_adaptive(batch, lambda pkts: _call_audit(payload, pkts, first_pass_by_id, parsed))
+        runnable_batches.append(batch)
+    batch_results = run_concurrent_map(
+        runnable_batches, lambda b: run_adaptive(b, lambda pkts: _call_audit(payload, pkts, first_pass_by_id, parsed)),
+        max_workers=max(1, settings.semantic_judge_concurrency), profile_label="final_audit",
+    )
+    for leaves, stats in batch_results:
         meta.batch_count += stats.batches_attempted
         meta.successful_batches += stats.successful_batches
         meta.failed_batches += stats.failed_batches

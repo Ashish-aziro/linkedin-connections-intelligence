@@ -1,3 +1,12 @@
+/**
+ * Round a raw score to a whole-number percentage of its max (default 100).
+ * Returns 0 for a non-positive max instead of NaN/Infinity.
+ */
+export function formatPercent(value: number, max = 100): number {
+  if (!max || max <= 0) return 0;
+  return Math.round((value / max) * 100);
+}
+
 export function scoreColor(score: number): { bar: string; text: string } {
   if (score >= 85) return { bar: "bg-emerald-500", text: "text-emerald-700" };
   if (score >= 70) return { bar: "bg-amber-500", text: "text-amber-700" };

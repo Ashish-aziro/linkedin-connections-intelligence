@@ -38,12 +38,14 @@ from app.schemas import (
     SearchResponse,
     SearchResultItem,
 )
+from app.constants import _RELIABLE_NEAR_RELATIONS
 from app.services.candidate_gate import hard_gate
 from app.services.candidate_pool import get_candidates
 from app.services.deadline import Deadline
 from app.services.judge_validator import validate_person
 from app.services.llm import budget as llm_budget
 from app.services.matching import company_matches, norm_company
+from app.services.near_match_service import build_near_matches
 from app.services.person_view import education_to_out, experience_to_out, skill_to_out
 from app.services.profile_authority import current_employer_from
 from app.services.query_interpreter import interpret_query
@@ -58,6 +60,16 @@ log = logging.getLogger("app.search")
 #: stored-response format version (V4 PART 7 §9). Bump when the persisted snapshot
 #: shape changes; ``load_search`` can then branch on ``SearchRunState.response_version``.
 RESPONSE_VERSION = 1
+
+#: review finding H1 — these ``ParsedSearchQuery`` fields are internal
+#: reasoning the schema itself documents as never shown to the frontend
+#: (near-match anchoring, an internal validator confidence bound). A bare
+#: ``model_dump()`` serialized them anyway, so the raw API response leaked
+#: them even though no UI code reads them today. Excluded at every point the
+#: parsed query is persisted or returned.
+_INTERNAL_QUERY_FIELDS = frozenset({
+    "primary_intent", "intent_anchor_criterion_ids", "interpretation_confidence_cap",
+})
 
 
 def _tier_key(s):
@@ -137,7 +149,7 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     with prof.stage("semantic_similarity"):
         if not deadline.expired():
             compute_semantic_similarity(
-                [facts_by_id[p.id] for p in viable], parsed, ctx, deadline=deadline
+                [facts_by_id[p.id] for p in viable], parsed, ctx, deadline=deadline, db=db,
             )
 
     # ── local pre-score the viable set — evidence / prior signal only,
@@ -168,8 +180,10 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
                 query, parsed, bundle, ctx,
                 network_size=total, pool_size=len(candidates),
                 hard_rejected_count=len(hard_rejected), local_scored=prescored,
+                db=db,
             )
         with prof.stage("verification_validation"):
+            newly_validated: dict[str, dict[str, dict]] = {}
             for pid, person_verdicts in fv_run.verdicts.items():
                 packet = fv_run.packets_by_id.get(pid)
                 if packet is None or pid not in facts_by_id:
@@ -177,6 +191,20 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
                 validated = validate_person(person_verdicts, packet, parsed, facts_by_id[pid], ctx)
                 if validated:
                     ctx.judge_results[pid] = validated
+                    newly_validated[pid] = validated
+        # TASK 4 — cache ONLY validated verdicts, and only ones NOT already
+        # served from the cache this run (re-writing a hit is a harmless no-op
+        # upsert but would understate how many calls the cache actually saved).
+        with prof.stage("verdict_cache_write"):
+            from app.services import semantic_verdict_cache
+            from app.services.semantic_judge import judgeable_criteria as _jcrits_fn
+
+            cache_writes = semantic_verdict_cache.store(
+                db, newly_validated, fv_run.packets_by_id, _jcrits_fn(parsed), parsed,
+                model=settings.anthropic_model, skip_keys=fv_run.cache_hit_keys,
+            )
+            prof.incr("verdict_cache_writes", cache_writes)
+            prof.incr("verdict_cache_hits", fv_run.metadata.get("cache_hits", 0))
         fv_metadata = fv_run.metadata
         # INVARIANT — a successful full-verification search reviewed EVERY filtered
         # candidate. If not, treat it as an incomplete verification (retryable),
@@ -223,24 +251,76 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     prof.incr("rescore_candidates", len(changed_ids & {p.id for p in viable}))
     with prof.stage("rescore"):
         scored: list[ScoredCandidate] = []
-        near_pool: list[ScoredCandidate] = []
+        near_pool: list[ScoredCandidate] = []  # legacy list — the final audit still appends to this
+        near_raw: list[tuple] = []             # (person, facts, scored, source) — feeds near_match_service
+        viable_not_match = 0
         for p in viable:
             r = score_candidate(facts_by_id[p.id], parsed, ctx) if p.id in changed_ids else prescored[p.id]
             if r.qualification == Qualification.NOT_MATCH:
+                near_raw.append((p, facts_by_id[p.id], r, "not_match"))
+                viable_not_match += 1
                 if len(r.unmet_required) == 1:
                     near_pool.append(r)
                 continue
             scored.append(r)
 
-        # hard-rejected candidates that miss only one thing — surfaced as
-        # near-matches. In FULL SONNET VERIFICATION mode they were NOT reviewed
-        # by Sonnet, so they are not surfaced at all (a successful result page
-        # only contains reviewed candidates).
-        if not full_mode:
-            for p in hard_rejected:
-                r = score_candidate(facts_by_id[p.id], parsed, ctx)
-                if r.qualification == Qualification.NOT_MATCH and len(r.unmet_required) <= 2:
+        # hard-rejected candidates — surfaced (if at all) via the intent-aware
+        # near-match pipeline below, which is what lets a candidate whose ONLY
+        # problem is a literal location mismatch still be recognised as
+        # professionally/geographically relevant instead of the story ending at
+        # the hard gate. This runs in EVERY mode, including FULL SONNET
+        # VERIFICATION: "a successful result page only contains reviewed
+        # candidates" is an invariant of the MAIN Exact/Possible results only
+        # (enforced above, unchanged) — it does not apply to Near Match, which
+        # has its OWN independent LLM review (near_match_judge) and its own
+        # hard invariant that a shown near match always has a validated
+        # useful_near_match=true verdict (near_match_service.build_near_matches).
+        # A candidate the hard gate rejected for one verified fact (e.g. a
+        # literal location mismatch) was never sent to full_verification
+        # either way, so ``score_candidate`` behaves identically in both modes
+        # here — this loop is UNCONDITIONAL (no ``if not full_mode`` guard) —
+        # see TASK 1/2 hardening below for the counters that make this
+        # traceable in production logs, not just trusted by reading the code.
+        hard_rejected_total = len(hard_rejected)
+        hard_rejected_scored = 0
+        hard_rejected_not_match = 0
+        hard_rejected_missing_gap_metadata = 0
+        hard_rejected_selected_for_near_pool = 0
+        for p in hard_rejected:
+            hard_rejected_scored += 1
+            r = score_candidate(facts_by_id[p.id], parsed, ctx)
+            if r.qualification == Qualification.NOT_MATCH:
+                hard_rejected_not_match += 1
+                if not r.unmet_required_ids:
+                    # should never happen (qualification NOT_MATCH implies
+                    # ``unmet`` was non-empty in score_candidate) — counted
+                    # defensively so a future scoring regression is visible
+                    # here instead of silently dropping the candidate's gap.
+                    hard_rejected_missing_gap_metadata += 1
+                near_raw.append((p, facts_by_id[p.id], r, "hard_gate_reject"))
+                if len(r.unmet_required) <= 2:
                     near_pool.append(r)
+                    hard_rejected_selected_for_near_pool += 1
+
+        # TASK 1 hardening (near-match candidate-coverage bug report) — one
+        # safe, aggregate-only accounting line for the hard-rejected -> near
+        # pool boundary. Counts only; never a name, location, or profile field.
+        log.info(
+            "near_match_candidate_construction: hard_rejected_total=%d "
+            "hard_rejected_passed_to_near_builder=%d hard_rejected_scored=%d "
+            "hard_rejected_not_match=%d hard_rejected_missing_gap_metadata=%d "
+            "hard_rejected_selected_for_near_pool=%d viable_not_match_candidates=%d",
+            hard_rejected_total, hard_rejected_total, hard_rejected_scored,
+            hard_rejected_not_match, hard_rejected_missing_gap_metadata,
+            hard_rejected_selected_for_near_pool, viable_not_match,
+        )
+        prof.incr("hard_rejected_total", hard_rejected_total)
+        prof.incr("hard_rejected_passed_to_near_builder", hard_rejected_total)
+        prof.incr("hard_rejected_scored", hard_rejected_scored)
+        prof.incr("hard_rejected_not_match", hard_rejected_not_match)
+        prof.incr("hard_rejected_missing_gap_metadata", hard_rejected_missing_gap_metadata)
+        prof.incr("hard_rejected_selected_for_near_pool", hard_rejected_selected_for_near_pool)
+        prof.incr("viable_not_match_candidates", viable_not_match)
 
     # ── FULL SONNET VERIFICATION display eligibility — only candidates whose
     #    review completed AND every required criterion is TRUE (EXACT) reach the
@@ -257,7 +337,15 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
             fv_metadata["excluded_false"] = len(near_pool)
 
     # ── NOW apply MIN_MATCH_SCORE (never before the judge, §22). A verified
-    #    EXACT_MATCH is kept even with a modest numeric score. ──
+    #    EXACT_MATCH is kept even with a modest numeric score. Below-threshold
+    #    POSSIBLE candidates are not simply discarded — borderline confidence,
+    #    not a failed requirement — they feed the near-match pool instead. ──
+    _below_threshold = [
+        s for s in scored
+        if not (s.match_score >= settings.min_match_score or s.qualification == Qualification.EXACT_MATCH)
+    ]
+    near_raw.extend((s.person, facts_by_id[s.person.id], s, "below_threshold") for s in _below_threshold)
+    prof.incr("below_threshold_candidates", len(_below_threshold))
     scored = [
         s for s in scored
         if s.match_score >= settings.min_match_score or s.qualification == Qualification.EXACT_MATCH
@@ -311,6 +399,27 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
             fv_metadata["excluded_insufficient_evidence"] = (
                 fv_metadata.get("excluded_insufficient_evidence", 0) + len(audit_downgraded)
             )
+        # near-match hardening (bug report TASK 5) — a candidate the audit
+        # downgraded from EXACT to POSSIBLE (insufficient evidence at audit
+        # time, NOT a factual contradiction — a grounded contradiction is
+        # always INCORRECT/NOT_MATCH, handled separately above and already
+        # near-match-eligible) used to just vanish here: excluded from main
+        # results and NEVER reconsidered for Near Match. This gives them the
+        # SAME chance every other excluded-but-plausible candidate gets — a
+        # fresh, independently validated near-match verdict, never an
+        # automatic promotion (near_match_service still requires its own
+        # useful_near_match=true verdict; an audit REMOVAL for a grounded
+        # contradiction is untouched by this and stays authoritative).
+        for s in audit_downgraded:
+            av = audit_by_id.get(s.person.id) or {}
+            gap_ids = list(av.get("failed_required_ids") or [])
+            if not gap_ids or s.person.id not in facts_by_id:
+                continue  # no usable gap to ground a near-match request — skip, never guess
+            near_raw.append((
+                s.person, facts_by_id[s.person.id],
+                replace(s, qualification=Qualification.NOT_MATCH, unmet_required_ids=gap_ids),
+                "audit_downgrade_possible",
+            ))
 
     total_scored = len(scored)
     exact_n = sum(1 for s in scored if s.qualification == Qualification.EXACT_MATCH)
@@ -325,7 +434,7 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
         db,
         dataset_id=dataset_id,
         query_text=query,
-        interpreted_query_json=parsed.model_dump(),
+        interpreted_query_json=parsed.model_dump(exclude=_INTERNAL_QUERY_FIELDS),
         llm_provider=provider,
         llm_model=model,
         total_candidates=total_scored,
@@ -364,16 +473,60 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
             reason=item.reason, payload=item.model_dump(),
         )
 
-    near_pool.sort(key=lambda s: s.match_score, reverse=True)
-    seen_near: set[str] = set()
+    # ── INTENT-AWARE NEAR MATCHES — a separate, bounded, evidence-grounded pass
+    #    (never touches ``scored`` / ``survivors`` / ``top`` above). A candidate
+    #    the final audit itself downgraded is folded in too, tagged distinctly;
+    #    ``near_raw`` may contain the same person from more than one stage —
+    #    ``build_near_pool`` dedupes by person id, keeping the first. ─────────
+    near_raw_ids = {t[0].id for t in near_raw}
+    for r in near_pool:
+        if r.person.id not in near_raw_ids:
+            near_raw.append((r.person, facts_by_id.get(r.person.id), r, "audit_downgrade"))
+            near_raw_ids.add(r.person.id)
+
+    # near-match design PART 1/8 (v2): the LLM explaining WHY a person is
+    # still useful IS the feature — if it cannot complete (deadline spent,
+    # disabled, unavailable, or the pipeline raises for any other reason:
+    # transport error, malformed output, a validator bug), near_matches=[]
+    # rather than a heuristic/code-only substitute. This must NEVER turn a
+    # successful strict search into a failure — only the near-match section
+    # is skipped, the main results below are entirely unaffected.
+    near_matches_ranked: list[tuple] = []
+    near_match_metadata = None
+    if deadline.expired():
+        log.warning("search %r: deadline spent before the near-match pipeline — near_matches=[]", query)
+    else:
+        try:
+            with prof.stage("near_match"):
+                near_matches_ranked, near_match_metadata = build_near_matches(
+                    query, parsed, ctx, candidates=near_raw, vol_by_id=vol_by_id, rec_by_id=rec_by_id,
+                )
+        except Exception:  # noqa: BLE001 — near matches are supplemental; never fail the search for them
+            # log.exception() captures the full traceback at ERROR level — this
+            # must never be silent, only never fatal to the strict search. The
+            # query text itself is not sensitive (already logged unredacted
+            # elsewhere in this module); no API key, profile payload, prompt,
+            # or auth header is ever included here.
+            log.exception("near-match generation failed for search %r; returning strict results without near matches", query)
+            near_matches_ranked, near_match_metadata = [], None
+
     near_items: list[SearchResultItem] = []
-    for i, cand in enumerate(near_pool, start=1):
-        if cand.person.id in seen_near or len(near_items) >= 5:
-            continue
-        seen_near.add(cand.person.id)
-        near_reason = generate_reason(cand, query, allow_llm=False)
+    for cand, verdict in near_matches_ranked:
+        near_reason = verdict.get("short_reason") or generate_reason(cand, query, allow_llm=False)
+        # bug report PART 6 observability — a near match reached via
+        # "audit_downgrade_possible" (or the older audit-removal source) has a
+        # real audit decision behind it; surface it exactly like a main
+        # result does, instead of leaving audit_decision/audit_reason always
+        # None. ``audit_by_id`` is empty ``{}`` when the audit never ran
+        # (disabled, deadline) or for a candidate never in the audit pool
+        # (hard_gate_reject / not_match / below_threshold sources) — safe no-op then.
         item = _to_result_item(db, len(near_items) + 1, cand, parsed, query, reason=near_reason,
-                               facts=facts_by_id.get(cand.person.id))
+                               facts=facts_by_id.get(cand.person.id),
+                               audit=audit_by_id.get(cand.person.id))
+        relation = verdict.get("relation_type")
+        item.near_relation_type = relation if relation in _RELIABLE_NEAR_RELATIONS else None
+        item.near_relation_source = verdict.get("relation_source")
+        item.near_match_confidence = verdict.get("confidence")
         near_items.append(item)
         # near matches persist in their OWN bucket — same schema, qualification
         # stays not_match, never mixed into the main results (V4 PART 7 §4).
@@ -390,14 +543,16 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     # judge/audit batch counts already include every adaptive-split attempt.
     reason_calls = 1 if (llm_reason_pool and settings.llm_reason_generation
                         and any(c.evidence for c in llm_reason_pool)) else 0
+    near_match_calls = near_match_metadata.judge.batches if near_match_metadata else 0
     llm_calls = {
         "query_interpretation": calls_interpretation,
         "semantic_judge": judge_metadata.get("judge_batch_count", 0),
         "final_audit": (audit_metadata or {}).get("batch_count", 0),
         "reason_generation": reason_calls,
+        "near_match_judge": near_match_calls,
     }
     llm_calls["total"] = calls_interpretation + llm_calls["semantic_judge"] \
-        + llm_calls["final_audit"] + reason_calls
+        + llm_calls["final_audit"] + reason_calls + near_match_calls
     llm_calls["budget"] = {"max_calls": settings.search_llm_max_calls, "used_after_interpretation": llm_budget.used()}
     llm_calls["deadline"] = deadline.as_dict()
     llm_budget.clear_budget()
@@ -435,7 +590,7 @@ def run_connection_search(db: Session, *, dataset_id: str, query: str) -> Search
     return SearchResponse(
         search_id=sq.id,
         query=query,
-        interpreted_query=parsed.model_dump(),
+        interpreted_query=parsed.model_dump(exclude=_INTERNAL_QUERY_FIELDS),
         connections=ConnectionBucket(
             total_candidates=total_scored, returned=len(results), results=results,
             exact_match_count=exact_n, possible_match_count=possible_n, near_matches=near_items,
@@ -559,8 +714,18 @@ def _run_final_audit(db, query, parsed, scored, near_pool, ctx, facts_by_id, vol
         applied = v["applied_qualification"]
         if applied == Qualification.NOT_MATCH:
             if len(v["failed_required"]) == 1:
-                near_pool.append(replace(cand, qualification=Qualification.NOT_MATCH,
-                                         unmet_required=list(v["failed_required"])))
+                # near-match hardening (bug report TASK 5) — ``unmet_required_ids``
+                # was never set here before (``replace`` keeps the PRE-audit
+                # value, which for a candidate that was EXACT before the audit
+                # is empty), so this candidate could reach the near-match pool
+                # with no usable gap id — every relaxed_criterion_id the near-
+                # match LLM later proposed would fail validation. Now grounded
+                # in the audit's own ``failed_required_ids``.
+                near_pool.append(replace(
+                    cand, qualification=Qualification.NOT_MATCH,
+                    unmet_required=list(v["failed_required"]),
+                    unmet_required_ids=list(v.get("failed_required_ids") or []),
+                ))
             continue
         nc = replace(cand, qualification=applied)
         if applied == Qualification.POSSIBLE_MATCH and cand.qualification == Qualification.EXACT_MATCH:

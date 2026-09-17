@@ -33,6 +33,7 @@ from app.constants import FullVerificationStatus, TriState, VerdictState
 from app.schemas import CompactJudgeBatch, ParsedSearchQuery
 from app.services.judge_packet import build_packets, plan_payload
 from app.services.llm.adaptive_batch import run_adaptive
+from app.services.llm.concurrency import run_concurrent_map
 from app.services.llm.router import generate_structured
 from app.services.llm.token_estimate import MAX_OUTPUT_TOKENS, estimate_judge_output_tokens
 from app.services.semantic_judge import (
@@ -73,6 +74,9 @@ class FullVerificationRun:
     verdicts: dict[str, dict[str, dict]]
     packets_by_id: dict[str, dict]
     metadata: dict = field(default_factory=dict)
+    #: TASK 4 — (person_id, criterion_id) pairs already served from the verdict
+    #: cache this run; the caller must not re-write these back to the cache.
+    cache_hit_keys: set[tuple[str, str]] = field(default_factory=set)
 
 
 def _unknown_verdict(cid: str, *, missing: bool, reason: str = "") -> dict:
@@ -94,6 +98,7 @@ def run_full_verification(
     pool_size: int,
     hard_rejected_count: int,
     local_scored: dict | None = None,
+    db=None,
 ) -> FullVerificationRun:
     """``bundle``: ``[(person, ProfileFacts, {"volunteering": [...], "recommendations": [...]})]``
     — EVERY candidate that passed the hard-fact gate. No filtering here."""
@@ -134,21 +139,48 @@ def run_full_verification(
         "judge_failed_batches": 0,
         "omitted_criteria": 0,
         "omitted_people": 0,
+        "cache_hits": 0,
+        "cache_fully_cached_candidates": 0,
     }
 
     if not settings.full_llm_verification or not jcrits or not bundle:
         # legacy judge path owns non-full-verification searches
         return FullVerificationRun({}, {}, meta)
 
-    review_by_person = {p.id: list(all_ids) for (p, _f, _x) in bundle}
+    # packets built WITHOUT ``unresolved_criteria`` yet — TASK 4 needs the raw
+    # evidence content first (to compute each person's cache fingerprint)
+    # before deciding which criteria still need asking.
     packets = build_packets(
-        bundle, parsed, ctx, query=query, unresolved_by_person=review_by_person,
+        bundle, parsed, ctx, query=query,
         max_packet_chars=settings.full_verification_max_packet_chars, full_profile=True,
     )
     packets_by_id = {pkt["person_id"]: pkt for pkt in packets}
     payload = plan_payload(query, parsed, jcrits)
 
-    verdicts: dict[str, dict[str, dict]] = {}
+    # ── TASK 4 — verdict cache lookup (single bulk query, main thread, BEFORE
+    #    any batching/concurrency starts). A hit means Claude is never asked
+    #    about that (person, criterion) at all this search. ─────────────────
+    cache_hits: dict[str, dict[str, dict]] = {}
+    if db is not None:
+        from app.services import semantic_verdict_cache
+
+        cache_hits = semantic_verdict_cache.lookup(db, packets_by_id, jcrits, parsed, model=settings.anthropic_model)
+    meta["cache_hits"] = sum(len(v) for v in cache_hits.values())
+
+    review_by_person = {
+        pid: [cid for cid in all_ids if cid not in cache_hits.get(pid, {})]
+        for pid in packets_by_id
+    }
+    meta["cache_fully_cached_candidates"] = sum(1 for v in review_by_person.values() if not v)
+    for pkt in packets:
+        pkt["unresolved_criteria"] = review_by_person[pkt["person_id"]]
+
+    verdicts: dict[str, dict[str, dict]] = {pid: dict(v) for pid, v in cache_hits.items()}
+    #: TASK 4 — (person_id, criterion_id) pairs already served from cache, so
+    #: the caller (search_service) never re-writes them back to the cache.
+    cache_hit_keys: set[tuple[str, str]] = {
+        (pid, cid) for pid, v in cache_hits.items() for cid in v
+    }
 
     def _absorb(leaves) -> None:
         for leaf in leaves:
@@ -178,16 +210,32 @@ def run_full_verification(
         return _call_judge(payload, pkts, review_by_person,
                            max_tokens_override=min(MAX_OUTPUT_TOKENS, _big * max(1, len(pkts))))
 
-    # ── 1. batched pass ────────────────────────────────────────────────
-    normal = [pkt for pkt in packets if not pkt.get("_packet_too_large")]
+    # ── 1. batched pass — TASK 3: independent batches run with bounded
+    #    concurrency (SEMANTIC_JUDGE_CONCURRENCY, default 3; 1 = sequential,
+    #    the exact pre-TASK-3 code path). Every batch's (leaves, stats) is
+    #    absorbed into the shared ``verdicts``/``meta`` ONLY here, back on the
+    #    main thread, in deterministic list order — worker threads never
+    #    mutate shared state directly. ─────────────────────────────────────
+    # TASK 4 — a candidate whose every criterion was served from cache has an
+    # EMPTY ``unresolved_criteria``; skip it here so it never occupies a batch
+    # slot asking Claude nothing.
+    normal = [
+        pkt for pkt in packets
+        if not pkt.get("_packet_too_large") and pkt.get("unresolved_criteria")
+    ]
     oversized_ids = [pkt["person_id"] for pkt in packets if pkt.get("_packet_too_large")]
     batches, over_by_chars = _make_batches(
         normal, size=settings.full_verification_batch_size,
         max_chars=settings.semantic_judge_max_batch_chars,
     )
     oversized_ids += [x for x in over_by_chars if x]
-    for batch in batches:
-        leaves, stats = run_adaptive(batch, _call)
+    concurrency = max(1, settings.semantic_judge_concurrency)
+    meta["concurrency"] = concurrency
+    batch_results = run_concurrent_map(
+        batches, lambda b: run_adaptive(b, _call),
+        max_workers=concurrency, profile_label="full_verification",
+    )
+    for leaves, stats in batch_results:
         _absorb_stats(stats)
         _absorb(leaves)
 
@@ -195,35 +243,75 @@ def run_full_verification(
         got = verdicts.get(pid, {})
         return [cid for cid in review_by_person.get(pid, []) if cid not in got]
 
-    # ── 2. single-person bounded retry ────────────────────────────────
+    # ── 2. single-person bounded retry — different candidates' retry
+    #    sequences are independent of each other (only a candidate's OWN prior
+    #    attempt decides whether it retries again), so they run concurrently;
+    #    each worker tracks its own progress locally and the main thread
+    #    absorbs every attempt afterwards, in order. ─────────────────────
     incomplete = [pid for pid in packets_by_id if _gaps(pid) and pid not in oversized_ids]
-    for pid in incomplete:
+
+    def _retry_person(pid: str) -> tuple[list[tuple[list, object]], int]:
+        runs: list[tuple[list, object]] = []
+        known = dict(verdicts.get(pid, {}))  # read-only snapshot — step 1 already merged
         for _ in range(max(0, settings.full_verification_single_retries)):
-            if not _gaps(pid):
+            if not [cid for cid in review_by_person.get(pid, []) if cid not in known]:
                 break
-            meta["single_person_retries"] += 1
             leaves, stats = run_adaptive([packets_by_id[pid]], _call)
+            runs.append((leaves, stats))
+            for leaf in leaves:
+                if leaf.outcome == "ok":
+                    known.update(leaf.payload.get(pid, {}))
+        return runs, len(runs)
+
+    retry_results = run_concurrent_map(
+        incomplete, _retry_person,
+        max_workers=concurrency, profile_label="full_verification_retry",
+    )
+    for runs, attempts in retry_results:
+        meta["single_person_retries"] += attempts
+        for leaves, stats in runs:
             _absorb_stats(stats)
             _absorb(leaves)
 
-    # ── 3. per-required-criterion targeted calls (also handles oversized) ──
-    needs_targeted = {pid for pid in packets_by_id if _gaps(pid)} | set(oversized_ids)
-    for pid in needs_targeted:
-        missing = [cid for cid in _gaps(pid)] or (list(all_ids) if pid in oversized_ids else [])
-        # prioritise required criteria
-        missing.sort(key=lambda c: (c not in required_ids))
-        did_chunk = False
+    # ── 3. per-required-criterion targeted calls (also handles oversized) —
+    #    different candidates run concurrently; within one candidate the
+    #    (few) missing criteria are called sequentially, since a candidate's
+    #    own missing set is small and this keeps ordering (required first)
+    #    simple. Meta counters/verdicts are merged in the main thread only. ──
+    needs_targeted = list({pid for pid in packets_by_id if _gaps(pid)} | set(oversized_ids))
+
+    def _targeted_for_person(pid: str) -> tuple[dict[str, dict], list[tuple[str | None, str | None]]]:
+        missing = list(_gaps(pid)) or (list(all_ids) if pid in oversized_ids else [])
+        missing.sort(key=lambda c: (c not in required_ids))  # prioritise required criteria
+        already = verdicts.get(pid, {})
+        local: dict[str, dict] = {}
+        calls: list[tuple[str | None, str | None]] = []
         for cid in missing:
-            if cid in verdicts.get(pid, {}):
+            if cid in already:
                 continue
             crit = next((c for c in jcrits if c.id == cid), None)
             if crit is None:
                 continue
-            v = _targeted_criterion_call(payload, packets_by_id[pid], pid, crit, meta)
+            v, provider, model_id = _targeted_criterion_call(payload, packets_by_id[pid], pid, crit)
+            calls.append((provider, model_id))
             if v is not None:
-                verdicts.setdefault(pid, {})[cid] = v
-                did_chunk = True
-        if did_chunk:
+                local[cid] = v
+        return local, calls
+
+    targeted_results = run_concurrent_map(
+        needs_targeted, _targeted_for_person,
+        max_workers=concurrency, profile_label="full_verification_targeted",
+    )
+    for pid, (local, calls) in zip(needs_targeted, targeted_results):
+        meta["targeted_criterion_calls"] += len(calls)
+        meta["total_llm_calls"] += len(calls)
+        for provider, model_id in calls:
+            if provider:
+                meta["providers"][provider] = meta["providers"].get(provider, 0) + 1
+            if model_id and model_id not in meta["models"]:
+                meta["models"].append(model_id)
+        if local:
+            verdicts.setdefault(pid, {}).update(local)
             meta["chunked_profile_reviews"] += 1
 
     # ── 4. resolve gaps ──────────────────────────────────────────────
@@ -266,15 +354,17 @@ def run_full_verification(
         meta["single_person_retries"], meta["chunked_profile_reviews"], meta["targeted_criterion_calls"],
         meta["total_llm_calls"], settings.anthropic_model,
     )
-    return FullVerificationRun(verdicts, packets_by_id, meta)
+    return FullVerificationRun(verdicts, packets_by_id, meta, cache_hit_keys)
 
 
-def _targeted_criterion_call(payload: dict, packet: dict, pid: str, crit, meta: dict) -> dict | None:
+def _targeted_criterion_call(
+    payload: dict, packet: dict, pid: str, crit,
+) -> tuple[dict | None, str | None, str | None]:
     """One tiny call: this person, this one criterion, a compacted packet. Output
-    is a single verdict so it never truncates. Returns a raw verdict dict, or
-    ``None`` when even this could not be completed."""
-    meta["targeted_criterion_calls"] += 1
-    meta["total_llm_calls"] += 1
+    is a single verdict so it never truncates. Returns ``(verdict_or_none,
+    provider, model_id)`` — TASK 3: no longer mutates a shared ``meta`` dict
+    directly (this can run concurrently across candidates); the caller merges
+    the returned counts/providers/models back in the main thread."""
     compact = _compact_packet_for(packet, crit)
     user = (
         "SEARCH PLAN:\n" + json.dumps(payload, ensure_ascii=False, default=str)
@@ -287,19 +377,15 @@ def _targeted_criterion_call(payload: dict, packet: dict, pid: str, crit, meta: 
         operation="full_verification_targeted", return_meta=True,
     )
     if result[0] is None:
-        return None
+        return None, None, None
     batch, provider, model_id, _m = result
-    if provider:
-        meta["providers"][provider] = meta["providers"].get(provider, 0) + 1
-    if model_id and model_id not in meta["models"]:
-        meta["models"].append(model_id)
     for pv in batch.people:
         if pv.person_id != pid:
             continue
         for cv in pv.criteria:
             if cv.criterion_id == crit.id:
-                return _expand_compact(cv, set())
-    return None
+                return _expand_compact(cv, set()), provider, model_id
+    return None, provider, model_id
 
 
 _HEAVY_KEYS = ("recommendations_received", "publications")

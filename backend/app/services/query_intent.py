@@ -720,6 +720,57 @@ def augment_plan(plan: ParsedSearchQuery, query: str) -> None:
     _drop_keyword_fallback(plan)
     _ensure_nonempty(plan, query)
     _renorm(plan)
+    _identify_primary_intent(plan)
+
+
+# ─────────────────────────── primary intent (near-match design PART 5) ───────────────────────────
+#
+# Which required criterion is the QUERY'S OWN POINT versus a CONSTRAINT on top
+# of it? "VCs in Atlanta" is fundamentally about finding investors; Atlanta
+# narrows that down. Generic by TYPE, never by matching specific query words —
+# a constraint type describes something that is checked as a fact about a
+# candidate but is rarely what a recruiter query is fundamentally "about";
+# everything else (what the person professionally DOES / IS) is eligible to
+# anchor the primary intent. INTERNAL ONLY — never rendered to the user, only
+# used to decide what a Near Match is allowed to relax (PART 3) and how Near
+# Matches are ranked against each other (PART 10).
+_CONSTRAINT_TYPES = {
+    CriterionType.LOCATION, CriterionType.CURRENT_COMPANY, CriterionType.PAST_COMPANY,
+    CriterionType.EDUCATION, CriterionType.CERTIFICATION, CriterionType.LANGUAGE,
+    CriterionType.PUBLICATION, CriterionType.YEARS_EXPERIENCE,
+}
+
+
+def _intent_text(c: SearchCriterion) -> str:
+    return c.concept or c.value or " or ".join(c.values) or c.type.replace("_", " ")
+
+
+def _identify_primary_intent(plan: ParsedSearchQuery) -> None:
+    """Prefer the query-interpretation LLM's own ``primary_intent`` /
+    ``intent_anchor_criterion_ids`` (it reads MEANING, not just criterion
+    type) — but NEVER trust it blindly: the anchor ids are re-validated here
+    against the FINAL criteria list (after every ``augment_plan`` mutation —
+    cross-domain expansion, modality, academia shaping, fallback cleanup —
+    since an id the LLM named may no longer exist by this point). An invalid
+    or missing anchor is dropped; if NONE survive, the deterministic
+    type-based derivation below is the fallback of record."""
+    valid_ids = {c.id for c in plan.criteria}
+    llm_anchor_ids = [cid for cid in plan.intent_anchor_criterion_ids if cid in valid_ids]
+    if plan.primary_intent.strip() and llm_anchor_ids:
+        plan.intent_anchor_criterion_ids = llm_anchor_ids
+        return
+
+    required = [c for c in plan.criteria if c.required]
+    anchors = [c for c in required if c.type not in _CONSTRAINT_TYPES]
+    if not anchors:
+        # every required criterion is a "constraint" type (e.g. "people in
+        # Austin at Google") — the constraint IS the point of the query, so it
+        # anchors itself. A query with no required criteria at all anchors on
+        # nothing; Near Match then has no secondary requirement to relax.
+        anchors = required
+    anchors = sorted(anchors, key=lambda c: c.weight, reverse=True)
+    plan.intent_anchor_criterion_ids = [c.id for c in anchors]
+    plan.primary_intent = "; ".join(dict.fromkeys(_intent_text(c) for c in anchors))
 
 
 # ─────────────────────────── helpers ───────────────────────────

@@ -146,6 +146,18 @@ export interface SearchResultItem {
   audit_reason?: string | null;
   audit_issues?: string[];
   llm_verified?: boolean;
+  // Near Match design PART 8-12 — set only on near-match rows (a near match
+  // with no validated AI verdict is never returned at all). A validated,
+  // generic category explaining WHY this person is still worth considering
+  // (e.g. "geographic_adjacent"); absent/null when not reliable enough to
+  // label.
+  near_relation_type?: string | null;
+  near_match_confidence?: number | null;
+  // Provenance of near_relation_type when it's "geographic_adjacent":
+  // "deterministic" (confirmed by stored location data) or "llm_inference"
+  // (the model's own world knowledge only — never a verified geographic
+  // fact). Not rendered directly; informs how confidently a label is shown.
+  near_relation_source?: string | null;
 }
 
 export interface SearchResponse {
@@ -222,6 +234,13 @@ export interface SearchResponse {
     chunked_profile_reviews?: number;
     targeted_criterion_calls?: number;
     total_llm_calls?: number;
+    // TASK 4/5 (perf) verdict cache — how many of this search's candidate
+    // verdicts were reused from an earlier search's ALREADY-VALIDATED review
+    // instead of a new Sonnet call. A cache hit is never stale/unvalidated
+    // (invalidated automatically on any evidence change) so "complete" is
+    // still accurate composed of cache hits + new calls.
+    cache_hits?: number;
+    cache_fully_cached_candidates?: number;
     excluded_false?: number;
     excluded_insufficient_evidence?: number;
     model?: string;

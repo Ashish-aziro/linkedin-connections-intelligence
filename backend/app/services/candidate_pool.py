@@ -35,6 +35,25 @@ _SCORABLE = (
 )
 
 
+#: fixed per-channel relevance floor used ONLY to rank the retrieval union
+#: before it is truncated to ``candidate_pool_size`` (review finding E1/E2) —
+#: NOT a match-quality score; that judgment is scoring.py's job downstream.
+#: A structured factual hit (title/company/skill/... literally matched in SQL)
+#: is the strongest recall signal, a semantic-assertion text hit is weaker, and
+#: a bare geographic hit is weakest (location alone rarely decides relevance).
+#: Embedding cosine similarity is used as-is (already a real per-candidate
+#: float in roughly 0..1) rather than a fixed constant, so the ranking still
+#: distinguishes a strong from a weak semantic match instead of only which
+#: channel found it.
+_SQL_CHANNEL_SCORE = 1.0
+_SEMANTIC_CHANNEL_SCORE = 0.75
+_GEO_CHANNEL_SCORE = 0.5
+#: bonus per extra corroborating channel — small and bounded so it can never
+#: invert the primary per-channel ordering above (it only breaks ties among
+#: candidates that would otherwise land at the identical channel score).
+_MULTI_CHANNEL_BONUS = 0.001
+
+
 def get_candidates(
     db: Session, dataset_id: str, parsed: ParsedSearchQuery, query_embedding: bytes | None
 ) -> tuple[list[Person], int]:
@@ -44,6 +63,7 @@ def get_candidates(
             .where(Person.dataset_id == dataset_id)
             .where(Person.is_connection.is_(True))
             .where(Person.enrichment_state.in_(_SCORABLE))
+            .order_by(Person.id)
         )
     )
     total = len(all_people)
@@ -51,40 +71,54 @@ def get_candidates(
         return all_people, total
 
     by_id = {p.id: p for p in all_people}
-    keep_ids: set[str] = set()
+    # every channel contributes a per-candidate relevance score, never a bare
+    # id — the old union-then-truncate merged four channels into a Python
+    # `set`, which discards ordering entirely (its iteration order is
+    # hash-bucket order, not relevance), and then sliced the first
+    # `candidate_pool_size` of that arbitrary order. A high-relevance
+    # candidate could be dropped purely by hash luck, and the result was not
+    # even reproducible across process restarts (PYTHONHASHSEED). Scoring
+    # every channel hit and sorting before truncation fixes both.
+    scores: dict[str, float] = {}
+    hit_count: dict[str, int] = {}
+
+    def _accumulate(pid_scores: dict[str, float]) -> None:
+        for pid, score in pid_scores.items():
+            if pid not in by_id:
+                continue
+            hit_count[pid] = hit_count.get(pid, 0) + 1
+            if score > scores.get(pid, float("-inf")):
+                scores[pid] = score
 
     # channel 1 — structured factual matches
-    keep_ids |= _sql_matches(db, dataset_id, parsed)
+    _accumulate({pid: _SQL_CHANNEL_SCORE for pid in _sql_matches(db, dataset_id, parsed)})
     # channel 2 — semantic assertion / industry / company-category text signals
-    keep_ids |= _semantic_matches(db, dataset_id, parsed)
+    _accumulate({pid: _SEMANTIC_CHANNEL_SCORE for pid in _semantic_matches(db, dataset_id, parsed)})
     # channel 3 — geographic
-    keep_ids |= _geo_matches(db, dataset_id, parsed)
+    _accumulate({pid: _GEO_CHANNEL_SCORE for pid in _geo_matches(db, dataset_id, parsed)})
     # channel 4 — embedding nearest-neighbours (always, so a purely-semantic query
-    # that no SQL channel caught still gets a real candidate set)
+    # that no SQL channel caught still gets a real candidate set). Computed
+    # ONCE against every embedded person in the dataset — the previous
+    # implementation could compute this twice (an initial capped pass, then an
+    # uncapped "top up" pass re-scanning every embedding again when the union
+    # was thin); a single unbounded pass is both simpler and cheaper.
     if query_embedding is not None:
         from app import repositories as repo
         from app.services.embeddings import cosine_scores
 
-        ranked = cosine_scores(query_embedding, repo.all_embeddings(db, dataset_id))
-        for pid, _score in ranked[: settings.candidate_pool_size]:
-            keep_ids.add(pid)
+        _accumulate(dict(cosine_scores(query_embedding, repo.all_embeddings(db, dataset_id))))
 
-    keep = [by_id[pid] for pid in keep_ids if pid in by_id]
-
-    # if the union is still thin, top up with more embedding neighbours
-    if query_embedding is not None and len(keep) < settings.candidate_pool_size:
-        from app import repositories as repo
-        from app.services.embeddings import cosine_scores
-
-        for pid, _s in cosine_scores(query_embedding, repo.all_embeddings(db, dataset_id)):
-            if pid not in keep_ids and pid in by_id:
-                keep.append(by_id[pid])
-                keep_ids.add(pid)
-            if len(keep) >= settings.candidate_pool_size:
-                break
+    # rank by relevance, then break any remaining tie on person id — fully
+    # deterministic regardless of dict/set iteration order or process restarts.
+    ranked = sorted(
+        scores.items(),
+        key=lambda kv: (-(kv[1] + _MULTI_CHANNEL_BONUS * (hit_count.get(kv[0], 1) - 1)), kv[0]),
+    )
+    keep_ids = [pid for pid, _score in ranked[: settings.candidate_pool_size]]
+    keep = [by_id[pid] for pid in keep_ids]
 
     log.info("candidate pool (union): %d of %d connections", len(keep), total)
-    return keep[: settings.candidate_pool_size], total
+    return keep, total
 
 
 def _q(db: Session, stmt) -> set[str]:

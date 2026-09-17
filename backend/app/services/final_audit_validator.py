@@ -119,6 +119,13 @@ def validate_audit(
 
     # ── §5–§11 — ground every REQUIRED review; convert ungrounded ones ──
     grounded_fail: list[str] = []
+    #: near-match hardening (bug report TASK 5) — the SAME criteria by id, not
+    #: just by display label. ``near_match_pool``/``near_match_validator`` key
+    #: a candidate's gap on ``unmet_required_ids``, never the label string;
+    #: without this a candidate excluded here for further Near Match
+    #: reconsideration has an unusably empty gap set.
+    grounded_fail_ids: list[str] = []
+    uncertain_required_ids: list[str] = []
     required_supported_ok = True
     required_evidence_lost = False
     det_uncertain = set(det.uncertain_required or [])
@@ -131,6 +138,7 @@ def validate_audit(
 
         if rv.get("audit_missing") or sr == "uncertain":
             required_supported_ok = False
+            uncertain_required_ids.append(cid)
             continue
 
         if sr == "unsupported":
@@ -139,10 +147,12 @@ def validate_audit(
             )
             if grounded or label in det_unmet:
                 grounded_fail.append(label)
+                grounded_fail_ids.append(cid)
             else:
                 rv["status_review"] = "uncertain"
                 rv["reason"] = (rv["reason"] + f" [downgraded: {gnote}]")[:240]
                 notes.append(f"'{label}' unsupported review is not grounded — {gnote}")
+                uncertain_required_ids.append(cid)
             required_supported_ok = False
             continue
 
@@ -168,6 +178,7 @@ def validate_audit(
                             "evidence ref and no deterministic proof]")[:240]
             notes.append(f"'{label}' supported review has no grounding — treated as uncertain")
             required_supported_ok = False
+            uncertain_required_ids.append(cid)
 
     # ── §29 — verified facts already disqualify: no APPROVAL possible ──
     if det.qualification == Qualification.NOT_MATCH:
@@ -175,6 +186,7 @@ def validate_audit(
         return _out(AuditDecision.INCORRECT, conf, raw, reviews, top_sup, top_con,
                     applied=Qualification.NOT_MATCH,
                     failed=(det.unmet_required or ["a verified fact"]),
+                    failed_ids=(det.unmet_required_ids or grounded_fail_ids or []),
                     notes=notes, llm_verified=False,
                     missing_required_reviews=missing_required_reviews,
                     first_pass_qualification=first_pass_qualification)
@@ -200,8 +212,10 @@ def validate_audit(
                      "criterion — downgraded to UNKNOWN (§2)")
 
     deterministic_proves_exact = det.qualification == Qualification.EXACT_MATCH
-    applied, failed = _apply(decision, first_pass_qualification, deterministic_proves_exact,
-                             grounded_fail)
+    applied, failed, failed_ids = _apply(
+        decision, first_pass_qualification, deterministic_proves_exact,
+        grounded_fail, grounded_fail_ids, uncertain_required_ids,
+    )
 
     # ── §3 — llm_verified means FULL, grounded audit coverage ───────
     full_coverage = (
@@ -218,7 +232,7 @@ def validate_audit(
     )
 
     return _out(decision, conf, raw, reviews, top_sup, top_con, applied=applied, failed=failed,
-                notes=notes, llm_verified=llm_verified,
+                failed_ids=failed_ids, notes=notes, llm_verified=llm_verified,
                 missing_required_reviews=missing_required_reviews,
                 first_pass_qualification=first_pass_qualification)
 
@@ -233,21 +247,34 @@ def _fresh_ctx(ctx: ScoringContext) -> ScoringContext:
     )
 
 
-def _apply(decision: str, fp: str, det_exact: bool, grounded_fail: list[str]):
+def _apply(
+    decision: str, fp: str, det_exact: bool,
+    grounded_fail: list[str], grounded_fail_ids: list[str], uncertain_required_ids: list[str],
+):
     """Allowed transitions (§8/§9). NEVER returns EXACT from a non-EXACT first
-    pass — the final auditor cannot manufacture confidence."""
+    pass — the final auditor cannot manufacture confidence.
+
+    Returns ``(applied_qualification, failed_labels, failed_ids)``. A
+    DOWNGRADE/UNKNOWN never has a grounded contradiction (that always forces
+    INCORRECT above) — its gap is the required criteria that stayed
+    ``uncertain`` (insufficient evidence, not a contradiction). Near-match
+    hardening (bug report TASK 5): a candidate excluded here for
+    reconsideration needs a REAL, non-empty gap id set, or it can never pass
+    ``near_match_validator``'s relaxed-criterion check."""
     if decision == AuditDecision.INCORRECT:
-        return Qualification.NOT_MATCH, (grounded_fail or ["a required criterion"])
+        return (Qualification.NOT_MATCH, grounded_fail or ["a required criterion"],
+                grounded_fail_ids or uncertain_required_ids)
     if decision == AuditDecision.DOWNGRADE:
-        return (Qualification.POSSIBLE_MATCH if fp == Qualification.EXACT_MATCH else fp), []
+        return (Qualification.POSSIBLE_MATCH if fp == Qualification.EXACT_MATCH else fp,
+                [], uncertain_required_ids)
     if decision == AuditDecision.UNKNOWN:
         if fp == Qualification.EXACT_MATCH and not det_exact:
-            return Qualification.POSSIBLE_MATCH, []
-        return fp, []
-    return fp, []  # APPROVED — keep the first-pass qualification unchanged
+            return Qualification.POSSIBLE_MATCH, [], uncertain_required_ids
+        return fp, [], uncertain_required_ids
+    return fp, [], []  # APPROVED — keep the first-pass qualification unchanged
 
 
-def _out(decision, conf, raw, reviews, top_sup, top_con, *, applied, failed, notes,
+def _out(decision, conf, raw, reviews, top_sup, top_con, *, applied, failed, failed_ids, notes,
          llm_verified, missing_required_reviews, first_pass_qualification) -> dict:
     unsupported_reasons = [
         r["reason"] for r in reviews if r["status_review"] == "unsupported" and r["reason"]
@@ -263,6 +290,9 @@ def _out(decision, conf, raw, reviews, top_sup, top_con, *, applied, failed, not
         "contradicting_evidence_refs": top_con,
         "applied_qualification": applied,
         "failed_required": failed,
+        # near-match hardening (bug report TASK 5) — same gap, by criterion id
+        # (near_match_pool/near_match_validator key on ids, never labels).
+        "failed_required_ids": failed_ids,
         "audit_issues": (notes + unsupported_reasons)[:8],
         "llm_verified": bool(llm_verified),
         "first_pass_qualification": first_pass_qualification,

@@ -15,8 +15,16 @@ clears it when the search is done.
 from __future__ import annotations
 
 import contextvars
+import threading
 
 _budget_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar("llm_call_budget", default=None)
+
+#: TASK 3 — worker threads that had the search thread's context copied into
+#: them (``app.services.llm.concurrency.run_concurrent_map``) see the SAME
+#: budget dict by reference (a context copy shares mutable values, it does not
+#: deep-copy them), so concurrent ``try_consume()`` calls need a real lock —
+#: the read-then-increment below is not atomic on its own.
+_lock = threading.Lock()
 
 
 def start_budget(max_calls: int) -> None:
@@ -35,10 +43,11 @@ def try_consume() -> bool:
     b = _budget_var.get()
     if b is None:
         return True
-    if b["used"] >= b["max"]:
-        return False
-    b["used"] += 1
-    return True
+    with _lock:
+        if b["used"] >= b["max"]:
+            return False
+        b["used"] += 1
+        return True
 
 
 def used() -> int:

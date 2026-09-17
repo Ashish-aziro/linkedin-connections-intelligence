@@ -120,6 +120,26 @@ class Settings(BaseSettings):
     #: has to be split repeatedly (slower + more calls). 3 keeps most batches
     #: in one call.
     full_verification_batch_size: int = 3
+    #: TASK 3 — bounded concurrency for independent Claude batch calls (the
+    #: full-verification main pass + single-person retries + targeted
+    #: criterion calls, and the near-match judge). 1 = fully sequential (the
+    #: pre-TASK-3 baseline, and the safest setting under a very low Anthropic
+    #: rate limit). Higher values overlap network wait across calls; keep this
+    #: bounded rather than unlimited so a large candidate pool cannot open
+    #: hundreds of simultaneous HTTP connections. Env var SEMANTIC_JUDGE_CONCURRENCY.
+    semantic_judge_concurrency: int = 3
+    #: TASK 4 — reuse an already-validated full-verification verdict for the
+    #: same person + criterion + evidence + model + prompt/schema version +
+    #: query context instead of asking Claude again (see
+    #: ``app.services.semantic_verdict_cache``). Off disables lookup AND
+    #: write — every search is verified fresh, the pre-TASK-4 behaviour.
+    semantic_verdict_cache_enabled: bool = True
+    #: TASK 5 — reuse a candidate's concept-vs-career cross-encoder score
+    #: across searches (see ``app.services.semantic_similarity_cache``). This
+    #: is a RANKING signal cache only — it never decides qualification, so
+    #: reuse only changes WHEN the ~20s-scale cross-encoder pass runs, never
+    #: what gets shown.
+    semantic_similarity_cache_enabled: bool = True
 
     # ── Search quality v2 ────────────────────────────────────
     relevance_weight: float = 20.0         # points reserved for whole-profile relevance
@@ -174,6 +194,24 @@ class Settings(BaseSettings):
     final_result_audit_batch_size: int = 10   # candidates per audit request (never 1/candidate)
     final_result_audit_max_packet_chars: int = 6000
     final_result_audit_max_batch_chars: int = 44000
+
+    # ── Near Match — intent-aware relaxed recommendation layer ──
+    #: master switch for the LLM near-match judge. False (or no LLM configured)
+    #: falls back to the deterministic-only near pool (bounded, ranked by local
+    #: score, no relation_type / LLM reason) — near matches are never just
+    #: disabled outright.
+    near_match_llm_enabled: bool = True
+    #: bounded local pool handed to the near-match judge (PART 4/15) — never the
+    #: whole network.
+    near_match_candidate_pool: int = 40
+    #: ONE authoritative near-match result count. Not forced — fewer genuinely
+    #: useful near matches are shown as fewer, never padded.
+    near_match_max_results: int = 5
+    near_match_judge_batch_size: int = 8
+    near_match_max_packet_chars: int = 6000
+    near_match_max_batch_chars: int = 40000
+    #: a validated near-match verdict below this confidence is dropped (PART 9).
+    near_match_min_confidence: float = 0.45
 
     # ── Current-user profile context (V4 PART 2 §3) ──────────
     #: Used ONLY to resolve relational queries like "anyone in my field" /

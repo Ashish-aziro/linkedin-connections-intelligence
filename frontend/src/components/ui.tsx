@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { scoreColor } from "../lib/format";
+import { formatPercent, scoreColor } from "../lib/format";
 
 export function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
   return (
@@ -76,19 +76,21 @@ export function ScoreMeter({
   max?: number;
   emphasis?: boolean;
 }) {
-  const pct = (value / max) * 100;
+  const pct = formatPercent(value, max);
   const c = scoreColor(pct);
   return (
     <div>
       <div className="flex items-baseline justify-between text-xs">
         <span className="font-medium uppercase tracking-wide text-ink-faint">{label}</span>
         <span className={`font-mono ${emphasis ? "text-lg font-bold" : "text-sm"} ${c.text}`}>
-          {Math.round(value)}
-          <span className="text-ink-faint">/{max}</span>
+          {pct}%
         </span>
       </div>
       <div className="mt-1 h-2 w-full overflow-hidden rounded-full bg-slate-200">
-        <div className={`h-full rounded-full ${c.bar}`} style={{ width: `${pct}%` }} />
+        <div
+          className={`h-full rounded-full ${c.bar}`}
+          style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+        />
       </div>
     </div>
   );

@@ -26,11 +26,26 @@ def _get_model():
     if _model is None:
         with _lock:
             if _model is None:
+                import time as _time
+
                 from sentence_transformers import CrossEncoder
 
                 log.info("loading cross-encoder %s", settings.reranker_model)
+                t0 = _time.perf_counter()
                 _model = CrossEncoder(settings.reranker_model)
+                log.info("cross-encoder loaded in %.1fs", _time.perf_counter() - t0)
     return _model
+
+
+def preload() -> None:
+    """TASK 5 — load the cross-encoder now (app startup). See
+    ``embeddings.preload`` — same no-op-once-loaded / never-raises contract."""
+    if not settings.reranker_enabled:
+        return
+    try:
+        _get_model()
+    except Exception:  # noqa: BLE001
+        log.exception("cross-encoder preload failed — will retry lazily on first use")
 
 
 def cross_encode(query: str, texts: list[str]) -> list[float]:

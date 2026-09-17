@@ -143,6 +143,20 @@ class InferredSkill(BaseModel):
         return v.strip()
 
 
+def _as_str_safe(v) -> str:
+    """Defensive scalar-or-list-or-dict -> str coercion for a free-text LLM
+    field (mirrors ``_coerce_str_list`` for the single-string case) — never
+    raises, never trusts an unexpected shape."""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v.strip()
+    if isinstance(v, (int, float, bool)):
+        return str(v)
+    lst = _coerce_str_list(v)
+    return lst[0] if lst else ""
+
+
 def _coerce_str_list(v):
     """Tolerate the model returning [{'name': x}] / [{'skill': x}] / 'a, b'."""
     if v is None:
@@ -627,6 +641,70 @@ class CompactAuditBatch(BaseModel):
                 if not isinstance(p, dict) or p.get("person_id")]
 
 
+# ─────────────────── validated LLM output: near-match judge ───────────────────
+#
+# A candidate here already FAILED the strict search plan (a hard-gate reject or
+# a required-criterion NOT_MATCH) — this judge answers a different, narrower
+# question: "is this person still worth showing as a Near Match, and why?" It
+# never feeds the strict Exact/Possible pipeline (V4 near-match design PART 3).
+
+
+class NearMatchVerdict(BaseModel):
+    person_id: str
+    useful_near_match: bool = False
+    confidence: float = Field(ge=0.0, le=1.0, default=0.0)
+    #: short description of how the candidate satisfies the query's PRIMARY
+    #: intent (not the failed constraint) — grounds the ranking, not shown
+    #: verbatim to the user.
+    satisfied_intent: str = ""
+    #: which of THIS candidate's failed/uncertain criteria is being relaxed.
+    #: Must be one of the ids the candidate actually failed — validated below.
+    relaxed_criterion_id: str = ""
+    #: one of ``ALL_NEAR_MATCH_RELATIONS`` — a fixed, generic vocabulary.
+    relation_type: str = "other_relevant"
+    #: packet evidence refs grounding this verdict — validated the same way as
+    #: the exhaustive judge (exp:/edu:/cert:/skill:/assertion:/company:/...).
+    evidence_refs: list[str] = []
+    #: <= ~200 chars, user-facing-safe (no internal jargon) explanation of why
+    #: this person is still worth considering.
+    short_reason: str = Field(default="", max_length=240)
+
+    @field_validator("relation_type", mode="before")
+    @classmethod
+    def _norm_relation(cls, v):
+        from app.constants import ALL_NEAR_MATCH_RELATIONS
+
+        v = str(v or "").strip().lower().replace(" ", "_").replace("-", "_")
+        return v if v in ALL_NEAR_MATCH_RELATIONS else "other_relevant"
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _clamp01(cls, v):
+        try:
+            return max(0.0, min(1.0, float(v)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    _norm_refs = field_validator("evidence_refs", mode="before")(staticmethod(_coerce_str_list))
+
+    @field_validator("short_reason", mode="before")
+    @classmethod
+    def _short(cls, v):
+        return (str(v or ""))[:240]
+
+
+class NearMatchJudgeBatch(BaseModel):
+    people: list[NearMatchVerdict] = []
+
+    @field_validator("people", mode="before")
+    @classmethod
+    def _drop_bad_people(cls, v):
+        if not v:
+            return []
+        return [p for p in (v if isinstance(v, list) else [v])
+                if not isinstance(p, dict) or p.get("person_id")]
+
+
 # ─────────────────── validated LLM output: query ───────────────────
 
 
@@ -666,6 +744,7 @@ class LenientSearchCriterion(BaseModel):
     scope: str | None = None
     concept: str | None = None
     modality: str | None = None
+    geo_strict: bool | None = None
 
 
 class LenientSearchPlan(BaseModel):
@@ -682,6 +761,12 @@ class LenientSearchPlan(BaseModel):
     unresolved: object | None = None
     interpretation_summary: object | None = None
     interpretation_confidence: object | None = None
+    #: near-match design PART 5 (v2) — the LLM's own read of the query's
+    #: central purpose vs its constraints. Re-validated against the FINAL
+    #: criteria ids downstream (query_intent._identify_primary_intent); never
+    #: trusted as-is.
+    primary_intent: object | None = None
+    intent_anchor_criterion_ids: object | None = None
 
     @field_validator("criteria", mode="before")
     @classmethod
@@ -712,6 +797,14 @@ class SearchCriterion(BaseModel):
     #: a soft ranking signal only — it is never a hard filter regardless of
     #: ``required``.
     modality: str = Modality.CERTAIN
+    #: LOCATION only — the query explicitly forbade nearby-city substitution
+    #: ("strictly in Atlanta", "only in Austin, not nearby suburbs"), as
+    #: opposed to an ordinary "in X" mention. Anthropic sets this from meaning;
+    #: the deterministic fact layer only ever turns it on from an unambiguous
+    #: literal phrase ("strictly"/"only"/"exclusively"), never off (review
+    #: finding F3). Defaults false — an ordinary required location still
+    #: allows the existing geographic Near Match relaxation, unchanged.
+    geo_strict: bool = False
 
     @field_validator("modality")
     @classmethod
@@ -789,6 +882,33 @@ class ParsedSearchQuery(BaseModel):
     unresolved: list[str] = []
     #: one plain-English sentence describing how the query was read (V4 §18)
     interpretation_summary: str = ""
+    #: near-match design PART 5 — a short INTERNAL-ONLY description of the
+    #: query's central professional purpose (e.g. "venture capital / investment
+    #: professional"), as distinct from constraints like a named location or
+    #: company. Never shown on the frontend; used only to rank/relax Near
+    #: Matches so a strong match on the actual point of the query outranks a
+    #: candidate who only matches a secondary constraint (PART 10).
+    #:
+    #: Preferably supplied directly by the query-interpretation LLM (it can
+    #: read MEANING, not just criterion type); ``query_intent._identify_
+    #: primary_intent`` re-validates ``intent_anchor_criterion_ids`` against
+    #: the FINAL criteria list and falls back to a deterministic, type-based
+    #: derivation when the LLM omitted this or named ids that don't exist —
+    #: an LLM string is never trusted without that check.
+    primary_intent: str = ""
+    #: ids (from ``criteria``) of the required criteria that make up the
+    #: primary intent above — everything else is a constraint. INTERNAL ONLY.
+    intent_anchor_criterion_ids: list[str] = []
+
+    @field_validator("primary_intent", mode="before")
+    @classmethod
+    def _norm_primary_intent(cls, v) -> str:
+        return _as_str_safe(v)
+
+    @field_validator("intent_anchor_criterion_ids", mode="before")
+    @classmethod
+    def _norm_intent_anchors(cls, v):
+        return _coerce_str_list(v)
 
     @field_validator("intent", mode="before")
     @classmethod
@@ -878,6 +998,21 @@ class SearchResultItem(BaseModel):
     #: True only when the final auditor APPROVED this candidate against validated
     #: evidence — a stronger signal than the deterministic qualification alone.
     llm_verified: bool = False
+    #: near-match design PART 8-12 — set ONLY on near-match rows. A generic,
+    #: validated category (see ``NearMatchRelation``) explaining WHY this person
+    #: is a useful near match, e.g. "geographic_adjacent" / "role_adjacent".
+    #: None for main-bucket results (a near match with no validated LLM verdict
+    #: is never shown at all — near-match design PART 1, v2).
+    near_relation_type: str | None = None
+    #: the near-match judge's own confidence (0..1) in this recommendation,
+    #: after evidence validation. Always present on a near-match row (there is
+    #: no unverified/deterministic-only near match any more).
+    near_match_confidence: float | None = None
+    #: provenance of ``near_relation_type`` when it is "geographic_adjacent":
+    #: "deterministic" (structured city/state data confirmed it) or
+    #: "llm_inference" (only the model's own world knowledge did — kept, but
+    #: never presented as a verified geographic fact). None otherwise.
+    near_relation_source: str | None = None
 
 
 class ConnectionBucket(BaseModel):

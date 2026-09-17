@@ -129,6 +129,10 @@ class ScoredCandidate:
     qualification: str = Qualification.POSSIBLE_MATCH
     #: required criteria that were FALSE or unmet (for near-match explanations)
     unmet_required: list[str] = field(default_factory=list)
+    #: same criteria as ``unmet_required``, by id instead of label — lets the
+    #: near-match layer look up the actual SearchCriterion that failed without
+    #: re-deriving it from free text (near-match design PART 4/8).
+    unmet_required_ids: list[str] = field(default_factory=list)
     #: required semantic criteria that are UNKNOWN (why this is only POSSIBLE)
     uncertain_required: list[str] = field(default_factory=list)
     #: criterion_id -> TriState, for every tri-state (semantic / structured-NOT)
@@ -863,6 +867,7 @@ def score_candidate(
     scale = (100.0 - rel_w) / 100.0
 
     unmet: list[str] = []          # required + confidently FALSE / below the fact bar
+    unmet_ids: list[str] = []      # same, by criterion id
     uncertain: list[str] = []      # required semantic + UNKNOWN
     status_by_criterion: dict[str, str] = {}
 
@@ -882,6 +887,7 @@ def score_candidate(
             if status is not None:  # semantic tri-state OR structured-NOT tri-state (§3)
                 if status == TriState.FALSE:
                     unmet.append(_label(crit))
+                    unmet_ids.append(crit.id)
                 elif status != TriState.TRUE:
                     uncertain.append(_label(crit))
             elif crit.type in _BINARY_FACT_TYPES:
@@ -889,10 +895,13 @@ def score_candidate(
                 # recency weighting must not demote a real match (review #1)
                 if strength < _REQUIRED_MIN:
                     unmet.append(_label(crit))
+                    unmet_ids.append(crit.id)
             elif strength < _REQUIRED_MIN:
                 unmet.append(_label(crit))          # clear miss
+                unmet_ids.append(crit.id)
             elif strength < _EXACT_MIN:
                 unmet.append(_label(crit))          # partial (Director when CXO asked) -> near-match
+                unmet_ids.append(crit.id)
 
         total += score
         if strength >= _MATCHED_MIN:
@@ -912,8 +921,8 @@ def score_candidate(
             person=facts.person, match_score=round(min(100.0, total), 1), components=components,
             evidence=[], matched_criteria=matched,
             excluded_reason=f"required criterion not met: {unmet[0]}",
-            qualification=qualification, unmet_required=unmet, uncertain_required=uncertain,
-            status_by_criterion=status_by_criterion,
+            qualification=qualification, unmet_required=unmet, unmet_required_ids=unmet_ids,
+            uncertain_required=uncertain, status_by_criterion=status_by_criterion,
         )
 
     if rel_w > 0:
